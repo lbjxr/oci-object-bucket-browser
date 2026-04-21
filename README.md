@@ -84,9 +84,9 @@ OCI_COMPARTMENT_ID=
 OCI_PREVIEW_TEXT_LIMIT=20000
 OCI_MAX_LIST_LIMIT=200
 
-APP_AUTH_USERNAME=admin
-APP_AUTH_PASSWORD=change-me
-APP_SESSION_SECRET=change-this-session-secret
+APP_AUTH_USERNAME=your_admin_username
+APP_AUTH_PASSWORD=your_admin_password_here
+APP_SESSION_SECRET=replace_with_a_random_long_session_secret
 APP_SESSION_COOKIE_NAME=oci_bucket_browser_session
 ```
 
@@ -153,9 +153,9 @@ from fastapi.testclient import TestClient
 from app.config import get_settings
 from app.main import create_app
 
-os.environ['APP_AUTH_USERNAME'] = 'admin'
-os.environ['APP_AUTH_PASSWORD'] = 'secret123'
-os.environ['APP_SESSION_SECRET'] = 'test-session-secret'
+os.environ['APP_AUTH_USERNAME'] = 'test-admin'
+os.environ['APP_AUTH_PASSWORD'] = 'test-password-for-smoke'
+os.environ['APP_SESSION_SECRET'] = 'test-session-secret-for-smoke'
 get_settings.cache_clear()
 client = TestClient(create_app())
 assert client.get('/', follow_redirects=False).status_code == 303
