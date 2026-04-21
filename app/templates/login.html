@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block title %}登录 · {{ app_title }}{% endblock %}
+
+{% block content %}
+<section class="login-layout">
+  <div class="login-card card">
+    <div class="login-hero">
+      <p class="eyebrow">Protected Access</p>
+      <h1>先登录，再看 Bucket</h1>
+      <p class="subtitle">上传、列表、预览、下载页面都已加上登录保护。</p>
+    </div>
+
+    {% if error %}
+    <div class="alert alert-error">{{ error }}</div>
+    {% endif %}
+
+    <form action="/login" method="post" class="stack-form">
+      <input type="hidden" name="next_path" value="{{ next_path }}">
+
+      <label class="field-label" for="username">用户名</label>
+      <input id="username" class="input-text" type="text" name="username" autocomplete="username" required>
+
+      <label class="field-label" for="password">密码</label>
+      <input id="password" class="input-text" type="password" name="password" autocomplete="current-password" required>
+
+      <button class="button" type="submit">登录</button>
+    </form>
+  </div>
+</section>
+{% endblock %}

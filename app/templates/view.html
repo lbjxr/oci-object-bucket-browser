@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+
+{% block title %}{{ object_name }} · {{ app_title }}{% endblock %}
+
+{% block content %}
+<section class="card panel preview-shell">
+  <div class="preview-toolbar">
+    <div>
+      <a class="back-link" href="/">← 返回列表</a>
+      <h1>{{ object_name }}</h1>
+      <p class="subtitle">类型：{{ preview.content_type }}</p>
+    </div>
+    <a class="button" href="/download/{{ object_name }}">下载文件</a>
+  </div>
+
+  <div class="preview-area">
+    {% if preview.kind == 'text' %}
+      <pre class="preview-text">{{ preview.text }}</pre>
+    {% elif preview.kind == 'image' %}
+      <div class="media-frame">
+        <img src="{{ data_url }}" alt="{{ object_name }}">
+      </div>
+    {% elif preview.kind == 'pdf' %}
+      <div class="media-frame">
+        <iframe src="{{ data_url }}" width="100%" height="900"></iframe>
+      </div>
+    {% else %}
+      <div class="empty-state">当前类型不支持在线预览，请直接下载。</div>
+    {% endif %}
+  </div>
+</section>
+{% endblock %}

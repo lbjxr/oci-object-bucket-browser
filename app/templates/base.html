@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ app_title }}{% endblock %}</title>
+  <link rel="stylesheet" href="/static/css/app.css?v=20260421-2138">
+</head>
+<body>
+  <div class="page-shell">
+    {% if is_authenticated %}
+    <header class="topbar card">
+      <div>
+        <a href="/" class="brand">☁️ {{ app_title }}</a>
+        <p class="subtitle">轻量、清爽的 OCI 对象存储浏览器</p>
+      </div>
+      <div class="topbar-actions">
+        <span class="welcome">已登录：{{ auth_username }}</span>
+        <form action="/logout" method="post">
+          <button class="button button-secondary" type="submit">退出登录</button>
+        </form>
+      </div>
+    </header>
+    {% endif %}
+
+    {% block content %}{% endblock %}
+  </div>
+</body>
+</html>

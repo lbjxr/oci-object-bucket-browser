@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+
+{% block title %}对象列表 · {{ app_title }}{% endblock %}
+
+{% block content %}
+<section class="hero card compact-hero">
+  <div>
+    <p class="eyebrow">Object Storage</p>
+    <h1>Bucket 对象浏览</h1>
+    <p class="subtitle">上传、筛选、预览、下载，一页完成。</p>
+  </div>
+</section>
+
+{% if error %}
+<div class="alert alert-error">{{ error }}</div>
+{% endif %}
+
+<div class="grid two-columns form-grid">
+  <section class="card panel compact-panel form-panel">
+    <div class="panel-header">
+      <h2>上传文件</h2>
+      <p>直接上传到当前 bucket。</p>
+    </div>
+    <form action="/upload" method="post" enctype="multipart/form-data" class="stack-form">
+      <label class="field-label" for="file">选择文件</label>
+      <input id="file" class="input-file" type="file" name="file" required>
+      <button class="button" type="submit">上传到 Bucket</button>
+    </form>
+  </section>
+
+  <section class="card panel compact-panel form-panel">
+    <div class="panel-header">
+      <h2>前缀过滤</h2>
+      <p>比如 <code>images/</code>、<code>docs/2026/</code></p>
+    </div>
+    <form action="/" method="get" class="stack-form">
+      <label class="field-label" for="prefix">对象前缀</label>
+      <input id="prefix" class="input-text" type="text" name="prefix" value="{{ prefix }}" placeholder="按前缀过滤，例如 images/">
+      <div class="button-row">
+        <button class="button" type="submit">应用过滤</button>
+        <a class="button button-secondary" href="/">清空</a>
+      </div>
+    </form>
+  </section>
+</div>
+
+<section class="card panel table-panel">
+  <div class="panel-header panel-header-inline">
+    <div>
+      <h2>对象列表</h2>
+      <p>{% if prefix %}当前前缀：<code>{{ prefix }}</code>{% else %}展示 bucket 当前可见对象{% endif %}</p>
+    </div>
+    <span class="pill">共 {{ objects|length }} 项</span>
+  </div>
+
+  <div class="object-list single-list">
+    {% for obj in objects %}
+    <article class="object-card object-card-unified object-row-card">
+      <div class="object-row-shell">
+        <div class="object-row-main">
+          <div class="object-main">
+            <div class="object-name">{{ obj.name }}</div>
+            <div class="object-subline">
+              <span>{{ obj.content_type or '未知类型' }}</span>
+              <span class="dot-sep">•</span>
+              <span>{{ obj.time_display }}</span>
+            </div>
+          </div>
+          <span class="object-size-badge">{{ obj.size_mb }}</span>
+        </div>
+        <div class="object-thumb-wrap">
+          {% if obj.is_image %}
+          <img class="object-thumb" src="/thumb/{{ obj.name }}" alt="{{ obj.name }}">
+          {% else %}
+          <div class="object-file-icon" aria-label="{{ obj.content_type or '未知类型' }}">{{ obj.file_icon }}</div>
+          {% endif %}
+        </div>
+      </div>
+      <div class="object-toolbar">
+        <a class="toolbar-link" href="/view/{{ obj.name }}">预览</a>
+        <a class="toolbar-link" href="/download/{{ obj.name }}">下载</a>
+      </div>
+    </article>
+    {% else %}
+    <div class="empty-state">这里还没有对象，或者当前前缀下没有结果。</div>
+    {% endfor %}
+  </div>
+</section>
+{% endblock %}
