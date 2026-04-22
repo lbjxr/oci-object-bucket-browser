@@ -40,6 +40,15 @@
 - 基于现有多选工具栏补了“下载所选”入口
 - 当前选中的对象会由服务端临时打成一个 ZIP 再返回浏览器下载
 - ZIP 内保留原始对象路径，适合当前结果里顺手捞走多个对象
+- 批量下载改为容错模式：单个对象读取失败时，其他成功对象仍会继续打包导出
+- 若存在失败项，会在 ZIP 内附带 `_batch_download_failures.json` 与 `_batch_download_failures.txt`
+- 批量下载响应头增加 `X-Batch-Requested-Count` / `X-Batch-Archived-Count` / `X-Batch-Failed-Count` / `X-Batch-Partial`
+
+### 单对象下载增强
+- 下载端点支持 `Accept-Ranges: bytes`
+- 支持单段 `Range` 请求，返回 `206 Partial Content`
+- 支持 `bytes=start-end` / `bytes=start-` / `bytes=-suffix`
+- 为浏览器续传、外部下载器断点续传、基于 Range 的多线程下载兼容打下基础
 
 ### 列表体验增强
 - 对象列表补充了更清楚的元信息
@@ -62,4 +71,5 @@
 - 断点恢复仍是轻量方案，不是网盘级完整断点续传
 - 重试策略已经更聪明，但还不是完整上传调度器
 - 远端对账依赖 OCI 返回的 part 列表与 ETag
-- 批量下载当前还是轻量同步打包，不是后台任务队列
+- 单对象下载当前只支持单段 Range，不支持 multipart/byteranges
+- 批量 ZIP 下载当前还是轻量同步打包，不是后台任务队列，也不适合真正的多线程断点下载

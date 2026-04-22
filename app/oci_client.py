@@ -17,7 +17,7 @@ from oci.object_storage.models import (
 )
 
 from app.config import Settings, get_settings
-from app.models import ObjectEntry, PreviewData
+from app.models import ObjectDownloadInfo, ObjectEntry, PreviewData
 from app.utils import guess_content_type, is_image_type, is_pdf_type, is_text_type
 
 
@@ -289,9 +289,12 @@ class OCIStorageService:
         except ServiceError as exc:
             raise OCIStorageError(f"删除失败: {exc.message}") from exc
 
-    def get_object(self, object_name: str):
+    def get_object(self, object_name: str, *, range_header: str | None = None):
         try:
-            return self.client.get_object(self.namespace, self.bucket_name, object_name)
+            kwargs = {}
+            if range_header:
+                kwargs["range"] = range_header
+            return self.client.get_object(self.namespace, self.bucket_name, object_name, **kwargs)
         except ServiceError as exc:
             raise OCIStorageError(f"下载失败: {exc.message}") from exc
 
@@ -309,10 +312,29 @@ class OCIStorageService:
             return PreviewData(kind="pdf", content_type=content_type, bytes_data=payload)
         return PreviewData(kind="download", content_type=content_type, download_only=True)
 
-    def open_stream(self, object_name: str) -> tuple[BytesIO, str]:
-        response = self.get_object(object_name)
+    def head_object(self, object_name: str) -> ObjectDownloadInfo:
+        try:
+            response = self.client.head_object(self.namespace, self.bucket_name, object_name)
+        except ServiceError as exc:
+            raise OCIStorageError(f"获取对象信息失败: {exc.message}") from exc
+        size_header = response.headers.get("content-length")
+        size = int(size_header) if size_header and str(size_header).isdigit() else None
         content_type = guess_content_type(object_name, response.headers.get("content-type"))
-        return BytesIO(response.data.content), content_type
+        return ObjectDownloadInfo(
+            size=size,
+            etag=response.headers.get("etag"),
+            content_type=content_type,
+        )
+
+    def open_stream(self, object_name: str, *, range_header: str | None = None) -> tuple[BytesIO, str, dict[str, str]]:
+        response = self.get_object(object_name, range_header=range_header)
+        content_type = guess_content_type(object_name, response.headers.get("content-type"))
+        headers: dict[str, str] = {}
+        for header_name in ("content-length", "content-range", "etag", "last-modified"):
+            header_value = response.headers.get(header_name)
+            if header_value:
+                headers[header_name] = str(header_value)
+        return BytesIO(response.data.content), content_type, headers
 
 
 __all__ = ["OCIStorageService", "OCIStorageError", "classify_upload_exception", "extract_retry_after_seconds"]

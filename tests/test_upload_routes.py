@@ -76,12 +76,34 @@ def make_client(tmp_path: Path):
         def list_objects(self, prefix=''):
             return []
 
-        def open_stream(self, object_name):
+        def head_object(self, object_name):
+            from app.models import ObjectDownloadInfo
+            payload = getattr(self, 'download_payloads', {}).get(object_name)
+            if payload is None:
+                raise AssertionError(f'unexpected head_object for {object_name}')
+            return ObjectDownloadInfo(
+                size=len(payload),
+                etag=f'etag-{object_name}',
+                content_type='application/octet-stream',
+            )
+
+        def open_stream(self, object_name, *, range_header=None):
             payload = getattr(self, 'download_payloads', {}).get(object_name)
             if payload is None:
                 raise AssertionError(f'unexpected open_stream for {object_name}')
             from io import BytesIO
-            return BytesIO(payload), 'application/octet-stream'
+            headers = {'content-length': str(len(payload)), 'etag': f'etag-{object_name}'}
+            if range_header:
+                unit, raw = range_header.split('=', 1)
+                assert unit == 'bytes'
+                start_text, end_text = raw.split('-', 1)
+                start = int(start_text)
+                end = int(end_text)
+                sliced = payload[start:end + 1]
+                headers['content-length'] = str(len(sliced))
+                headers['content-range'] = f'bytes {start}-{end}/{len(payload)}'
+                return BytesIO(sliced), 'application/octet-stream', headers
+            return BytesIO(payload), 'application/octet-stream', headers
 
         def get_preview(self, object_name):
             raise AssertionError('not used in this test')
@@ -169,11 +191,111 @@ def test_batch_download_returns_zip_of_selected_objects(tmp_path):
     assert response.status_code == 200
     assert response.headers['content-type'].startswith('application/zip')
     assert 'attachment; filename="oci-batch-docs-2items-' in response.headers['content-disposition']
+    assert response.headers['x-batch-requested-count'] == '2'
+    assert response.headers['x-batch-archived-count'] == '2'
+    assert response.headers['x-batch-failed-count'] == '0'
+    assert response.headers['x-batch-partial'] == '0'
 
     archive = zipfile.ZipFile(io.BytesIO(response.content))
     assert sorted(archive.namelist()) == ['docs/a.txt', 'images/b.png']
     assert archive.read('docs/a.txt') == b'hello-a'
     assert archive.read('images/b.png') == b'hello-b'
+
+
+
+def test_batch_download_skips_failed_objects_and_emits_failure_manifest(tmp_path):
+    import io
+    import json as _json
+    import zipfile
+
+    client, fake_storage = make_client(tmp_path)
+    fake_storage.download_payloads = {
+        'docs/a.txt': b'hello-a',
+        'images/b.png': b'hello-b',
+    }
+
+    response = client.post(
+        '/objects/batch-download?prefix=mixed/',
+        json={'object_names': ['docs/a.txt', 'missing/c.txt', 'images/b.png']},
+    )
+    assert response.status_code == 200
+    assert response.headers['x-batch-requested-count'] == '3'
+    assert response.headers['x-batch-archived-count'] == '2'
+    assert response.headers['x-batch-failed-count'] == '1'
+    assert response.headers['x-batch-partial'] == '1'
+
+    archive = zipfile.ZipFile(io.BytesIO(response.content))
+    assert sorted(archive.namelist()) == [
+        '_batch_download_failures.json',
+        '_batch_download_failures.txt',
+        'docs/a.txt',
+        'images/b.png',
+    ]
+    manifest = _json.loads(archive.read('_batch_download_failures.json').decode('utf-8'))
+    assert manifest['requested_count'] == 3
+    assert manifest['archived_count'] == 2
+    assert manifest['failed_count'] == 1
+    assert manifest['failed'] == [
+        {'object_name': 'missing/c.txt', 'detail': '异常信息：unexpected open_stream for missing/c.txt'}
+    ]
+    failure_text = archive.read('_batch_download_failures.txt').decode('utf-8')
+    assert 'missing/c.txt' in failure_text
+    assert '其他成功对象已正常导出' in failure_text
+
+
+
+def test_batch_download_fails_when_all_objects_fail(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    fake_storage.download_payloads = {}
+
+    response = client.post(
+        '/objects/batch-download',
+        json={'object_names': ['missing/a.txt', 'missing/b.txt']},
+    )
+    assert response.status_code == 500
+    assert response.json()['detail'] == '批量下载失败：所有对象都未能成功读取，未生成可用 ZIP。'
+
+
+
+def test_download_supports_range_requests(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    fake_storage.download_payloads = {
+        'docs/a.txt': b'0123456789',
+    }
+
+    response = client.get('/download/docs/a.txt', headers={'Range': 'bytes=2-5'})
+    assert response.status_code == 206
+    assert response.content == b'2345'
+    assert response.headers['accept-ranges'] == 'bytes'
+    assert response.headers['content-range'] == 'bytes 2-5/10'
+    assert response.headers['content-length'] == '4'
+    assert response.headers['etag'] == 'etag-docs/a.txt'
+
+
+
+def test_download_supports_suffix_range_requests(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    fake_storage.download_payloads = {
+        'docs/a.txt': b'0123456789',
+    }
+
+    response = client.get('/download/docs/a.txt', headers={'Range': 'bytes=-3'})
+    assert response.status_code == 206
+    assert response.content == b'789'
+    assert response.headers['content-range'] == 'bytes 7-9/10'
+    assert response.headers['content-length'] == '3'
+
+
+
+def test_download_rejects_multi_range_requests(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    fake_storage.download_payloads = {
+        'docs/a.txt': b'0123456789',
+    }
+
+    response = client.get('/download/docs/a.txt', headers={'Range': 'bytes=0-1,4-5'})
+    assert response.status_code == 416
+    assert response.json()['detail'] == '当前仅支持单段 Range 请求'
 
 
 
