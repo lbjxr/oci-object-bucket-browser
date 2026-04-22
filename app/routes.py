@@ -22,7 +22,7 @@ templates = Jinja2Templates(directory="app/templates")
 
 
 def build_upload_error_payload(*, part_num: int, exc: OCIStorageError) -> dict[str, object]:
-    return {
+    payload = {
         "ok": False,
         "part_num": part_num,
         "detail": str(exc),
@@ -30,6 +30,9 @@ def build_upload_error_payload(*, part_num: int, exc: OCIStorageError) -> dict[s
         "retryable": exc.retryable,
         "reason": exc.reason,
     }
+    if exc.retry_after_seconds is not None:
+        payload["retry_after_seconds"] = exc.retry_after_seconds
+    return payload
 
 
 def format_size_display(size: int | None) -> str:
@@ -432,13 +435,14 @@ async def upload_part(request: Request, response: Response, upload_id: str, part
         response.status_code = exc.status_code
         return build_upload_error_payload(part_num=part_num, exc=exc)
     except Exception as exc:
-        category, retryable, status_code, reason = classify_upload_exception(exc)
+        category, retryable, status_code, reason, retry_after_seconds = classify_upload_exception(exc)
         wrapped = OCIStorageError(
             f"上传分片失败（part {part_num}，{'可重试' if retryable else '不可重试'}，{category}）: {reason}",
             category=category,
             retryable=retryable,
             status_code=status_code,
             reason=reason,
+            retry_after_seconds=retry_after_seconds,
         )
         response.status_code = wrapped.status_code
         return build_upload_error_payload(part_num=part_num, exc=wrapped)

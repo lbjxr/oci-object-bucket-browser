@@ -175,6 +175,7 @@
   const MAX_PART_RETRIES = 4;
   const PART_RETRY_BASE_DELAY_MS = 800;
   const PART_RETRY_MAX_DELAY_MS = 5000;
+  const PART_RETRY_AFTER_MAX_DELAY_MS = 15000;
 
   const activeControllers = new Set();
   let currentUploadId = null;
@@ -443,27 +444,35 @@
     const errorCode = payload && payload.error_code ? payload.error_code : 'unknown';
     const retryable = typeof (payload && payload.retryable) === 'boolean'
       ? payload.retryable
-      : ['timeout', 'connection', 'http_5xx'].includes(errorCode);
+      : ['timeout', 'connection', 'http_5xx', 'http_429'].includes(errorCode);
     const reason = payload && payload.reason
       ? payload.reason
       : (error && error.message ? error.message : `分片 ${partNum} 上传失败`);
+    let retryAfterSeconds = null;
+    if (payload && Number.isFinite(Number(payload.retry_after_seconds))) {
+      retryAfterSeconds = Math.max(0, Math.round(Number(payload.retry_after_seconds)));
+    }
     return {
       errorCode,
       retryable,
       reason,
+      retryAfterSeconds,
       message: payload && payload.detail ? payload.detail : reason,
     };
   };
 
-  const retryDelayFor = (errorCode, attempt) => {
+  const retryDelayFor = (errorCode, attempt, retryAfterSeconds = null) => {
     const jitter = Math.floor(Math.random() * 250);
+    if (errorCode === 'http_429' && Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+      return Math.min(PART_RETRY_AFTER_MAX_DELAY_MS, retryAfterSeconds * 1000 + jitter);
+    }
     if (errorCode === 'timeout') {
       return Math.min(PART_RETRY_MAX_DELAY_MS, 1200 * attempt + jitter);
     }
     if (errorCode === 'connection') {
       return Math.min(PART_RETRY_MAX_DELAY_MS, 900 * attempt + jitter);
     }
-    if (errorCode === 'http_5xx') {
+    if (errorCode === 'http_5xx' || errorCode === 'http_429') {
       return Math.min(PART_RETRY_MAX_DELAY_MS, PART_RETRY_BASE_DELAY_MS * (2 ** (attempt - 1)) + jitter);
     }
     return Math.min(PART_RETRY_MAX_DELAY_MS, PART_RETRY_BASE_DELAY_MS * attempt + jitter);
@@ -473,6 +482,7 @@
     if (errorCode === 'timeout') return '请求超时';
     if (errorCode === 'connection') return '连接中断';
     if (errorCode === 'http_5xx') return '服务端 5xx';
+    if (errorCode === 'http_429') return 'OCI 限流 429';
     if (errorCode === 'http_4xx') return '请求被拒绝/4xx';
     return '未知错误';
   };
@@ -614,8 +624,14 @@
             throw new Error(`分片 ${partNum} 上传失败：${info.reason}（${errorLabel}，已重试 ${attempt} 次后停止）`);
           }
           const nextAttempt = attempt + 1;
-          const delayMs = retryDelayFor(info.errorCode, attempt);
-          detailEl.textContent = `分片 ${partNum} 失败：${errorLabel}；${Math.ceil(delayMs / 1000)} 秒后重试第 ${nextAttempt}/${MAX_PART_RETRIES} 次`;
+          const delayMs = retryDelayFor(info.errorCode, attempt, info.retryAfterSeconds);
+          const waitHint = info.errorCode === 'http_429' && Number.isFinite(info.retryAfterSeconds) && info.retryAfterSeconds > 0
+            ? `，遵循服务端建议等待约 ${info.retryAfterSeconds} 秒`
+            : '';
+          detailEl.textContent = `分片 ${partNum} 失败：${errorLabel}；${Math.ceil(delayMs / 1000)} 秒后重试第 ${nextAttempt}/${MAX_PART_RETRIES} 次${waitHint}`;
+          strategyEl.textContent = info.errorCode === 'http_429'
+            ? '策略：OCI multipart 分片并发上传（限流退避中）'
+            : '策略：OCI multipart 分片并发上传';
           etaEl.textContent = `ETA 重试等待 ${fmtDuration(delayMs / 1000)}`;
           await sleep(delayMs);
         }
@@ -633,6 +649,7 @@
     });
 
     await Promise.all(workers);
+    strategyEl.textContent = '策略：OCI multipart 分片并发上传';
     detailEl.textContent = '分片上传完成，正在合并...';
     const completed = await jsonFetch(`/api/uploads/${encodeURIComponent(currentUploadId)}/complete`, {
       method: 'POST',

@@ -542,6 +542,42 @@ def test_upload_part_http_4xx_stops_retry_early(tmp_path):
     assert 'HTTP 400' in payload['reason']
 
 
+def test_upload_part_http_429_is_retryable_and_returns_retry_after(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    init = client.post(
+        '/api/uploads/init',
+        json={
+            'filename': 'big.bin',
+            'file_size': 20 * 1024 * 1024,
+            'content_type': 'application/octet-stream',
+            'file_fingerprint': 'http-429-part',
+        },
+    )
+    upload_id = init.json()['upload_id']
+    fake_storage.fail_part_errors[1] = lambda: ServiceError(
+        status=429,
+        code='TooManyRequests',
+        headers={'retry-after': '7'},
+        message='slow down',
+        request_endpoint='/uploadPart',
+        client_version='test',
+        timestamp='now',
+        opc_request_id='req-429',
+    )
+
+    response = client.put(
+        f'/api/uploads/{upload_id}/part/1',
+        content=b'a' * (8 * 1024 * 1024),
+        headers={'Content-Type': 'application/octet-stream'},
+    )
+    assert response.status_code == 429
+    payload = response.json()
+    assert payload['retryable'] is True
+    assert payload['error_code'] == 'http_429'
+    assert payload['retry_after_seconds'] == 7
+    assert '建议等待约 7 秒后再试' in payload['reason']
+
+
 def test_delete_object_requires_login(tmp_path):
     client, fake_storage = make_client(tmp_path)
     client.cookies.clear()

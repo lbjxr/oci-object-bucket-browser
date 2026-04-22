@@ -23,7 +23,8 @@
 - 速度显示改为最近 `3 秒` 滑动窗口平均
 - 分片失败支持自动重试
 - 重试策略按错误类型区分
-- 上传接口返回更清楚的错误字段：`error_code` / `retryable` / `reason`
+- `429` 限流时会读取并透传 `Retry-After`，前端按建议等待时间退避
+- 上传接口返回更清楚的错误字段：`error_code` / `retryable` / `reason` / `retry_after_seconds`
 - 恢复上传时会对账 OCI 远端已上传 parts
 - 远端对账失败时支持保守降级恢复，但最终合并前仍会再次严格校验
 
