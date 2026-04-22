@@ -180,11 +180,11 @@ p {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
-  padding: 8px 10px;
-  border-radius: 999px;
+  padding: 10px 12px;
+  border-radius: 12px;
   background: rgba(227, 244, 255, 0.92);
   border: 1px solid rgba(51, 166, 255, 0.14);
-  min-height: 44px;
+  min-height: 46px;
 }
 
 .batch-delete-selection {
@@ -662,20 +662,21 @@ p {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 30px;
-  padding: 0 12px;
-  border-radius: 10px;
-  background: rgba(227, 244, 255, 0.95);
-  border: 1px solid rgba(51, 166, 255, 0.16);
+  min-height: 36px;
+  padding: 0 15px;
+  border-radius: 8px;
+  background: linear-gradient(180deg, #f3f9ff 0%, #e4f1ff 100%);
+  border: 1px solid rgba(51, 166, 255, 0.22);
   color: var(--primary-strong);
   font-weight: 700;
   font-size: 0.88rem;
   cursor: pointer;
+  box-shadow: 0 1px 2px rgba(18, 50, 74, 0.05);
 }
 
 .toolbar-link:hover {
   text-decoration: none;
-  background: rgba(214, 239, 255, 1);
+  background: linear-gradient(180deg, #eaf4ff 0%, #d9ebff 100%);
 }
 
 .toolbar-link-danger {
