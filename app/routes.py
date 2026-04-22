@@ -108,6 +108,10 @@ class UploadInitRequest(BaseModel):
     file_fingerprint: str | None = None
 
 
+class BatchDeleteRequest(BaseModel):
+    object_names: list[str]
+
+
 @router.get("/login", response_class=HTMLResponse)
 def login_page(request: Request, next: str = "/"):
     if request.session.get("authenticated"):
@@ -409,6 +413,79 @@ def download(request: Request, object_name: str):
         return StreamingResponse(stream, media_type=content_type, headers=headers)
     except OCIStorageError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.post("/objects/batch-delete")
+def batch_delete_objects(request: Request, payload: BatchDeleteRequest = Body(...)):
+    if not request.session.get("authenticated"):
+        return JSONResponse({"detail": "未登录"}, status_code=401)
+
+    object_names = []
+    seen = set()
+    for raw_name in payload.object_names:
+        name = (raw_name or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        object_names.append(name)
+
+    if not object_names:
+        raise HTTPException(status_code=400, detail="至少要选择一个对象")
+
+    storage = get_storage()
+    deleted = []
+    failed = []
+
+    for object_name in object_names:
+        try:
+            storage.delete_object(object_name)
+            deleted.append(object_name)
+        except OCIStorageError as exc:
+            failed.append({"object_name": object_name, "detail": str(exc)})
+        except Exception as exc:
+            failed.append({"object_name": object_name, "detail": f"异常信息：{exc}"})
+
+    deleted_count = len(deleted)
+    failed_count = len(failed)
+    requested_count = len(object_names)
+
+    if failed_count == 0:
+        message = f"批量删除成功：共删除 {deleted_count} 个对象。"
+        detail = f"已删除所选 {deleted_count} 个对象，当前前缀过滤上下文保持不变。"
+        return {
+            "ok": True,
+            "requested_count": requested_count,
+            "deleted_count": deleted_count,
+            "failed_count": failed_count,
+            "deleted": deleted,
+            "failed": failed,
+            "message": message,
+            "detail": detail,
+        }
+
+    failed_names = "、".join(item["object_name"] for item in failed[:5])
+    if failed_count == requested_count:
+        message = f"批量删除失败：{requested_count} 个对象均未删除。"
+        detail = f"失败对象：{failed_names}" if failed_names else "所选对象均删除失败。"
+        status_code = 500
+    else:
+        message = f"批量删除部分完成：成功 {deleted_count} 个，失败 {failed_count} 个。"
+        detail = f"失败对象：{failed_names}" if failed_names else "部分对象删除失败。"
+        status_code = 207
+
+    return JSONResponse(
+        {
+            "ok": False,
+            "requested_count": requested_count,
+            "deleted_count": deleted_count,
+            "failed_count": failed_count,
+            "deleted": deleted,
+            "failed": failed,
+            "message": message,
+            "detail": detail,
+        },
+        status_code=status_code,
+    )
 
 
 @router.delete("/objects/{object_name:path}")

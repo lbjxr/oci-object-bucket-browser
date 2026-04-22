@@ -53,6 +53,8 @@ def make_client(tmp_path: Path):
             self.aborts.append((object_name, multipart_upload_id))
 
         def delete_object(self, object_name):
+            if callable(getattr(self, 'delete_hook', None)):
+                return self.delete_hook(object_name)
             self.deleted_objects.append(object_name)
 
         def list_objects(self, prefix=''):
@@ -297,7 +299,91 @@ def test_delete_object_failure_is_reported(tmp_path):
     def boom(object_name):
         raise RuntimeError('missing object')
 
-    fake_storage.delete_object = boom
+    fake_storage.delete_hook = boom
     response = client.delete('/objects/missing.txt')
     assert response.status_code == 500
     assert response.json()['detail'] == '删除对象失败：missing.txt。异常信息：missing object'
+
+
+def test_batch_delete_objects_requires_at_least_one_name(tmp_path):
+    client, _ = make_client(tmp_path)
+    response = client.post('/objects/batch-delete', json={'object_names': []})
+    assert response.status_code == 400
+    assert response.json()['detail'] == '至少要选择一个对象'
+
+
+def test_batch_delete_objects_success(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    response = client.post(
+        '/objects/batch-delete',
+        json={'object_names': ['alpha.txt', 'folder/beta.txt', 'alpha.txt']},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['ok'] is True
+    assert payload['requested_count'] == 2
+    assert payload['deleted_count'] == 2
+    assert payload['failed_count'] == 0
+    assert payload['deleted'] == ['alpha.txt', 'folder/beta.txt']
+    assert fake_storage.deleted_objects == ['alpha.txt', 'folder/beta.txt']
+
+
+def test_batch_delete_objects_trims_empty_names_and_preserves_first_seen_order(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    response = client.post(
+        '/objects/batch-delete',
+        json={'object_names': ['  ', 'gamma.txt', ' alpha.txt ', 'gamma.txt', '', 'alpha.txt']},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['ok'] is True
+    assert payload['requested_count'] == 2
+    assert payload['deleted'] == ['gamma.txt', 'alpha.txt']
+    assert fake_storage.deleted_objects == ['gamma.txt', 'alpha.txt']
+
+
+def test_batch_delete_objects_partial_failure(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+
+    def selective_delete(object_name):
+        if object_name == 'folder/beta.txt':
+            raise RuntimeError('locked')
+        fake_storage.deleted_objects.append(object_name)
+
+    fake_storage.delete_hook = selective_delete
+    response = client.post(
+        '/objects/batch-delete',
+        json={'object_names': ['alpha.txt', 'folder/beta.txt', 'gamma.txt']},
+    )
+    assert response.status_code == 207
+    payload = response.json()
+    assert payload['ok'] is False
+    assert payload['requested_count'] == 3
+    assert payload['deleted_count'] == 2
+    assert payload['failed_count'] == 1
+    assert payload['deleted'] == ['alpha.txt', 'gamma.txt']
+    assert payload['failed'] == [{'object_name': 'folder/beta.txt', 'detail': '异常信息：locked'}]
+    assert fake_storage.deleted_objects == ['alpha.txt', 'gamma.txt']
+
+
+def test_batch_delete_objects_failure_when_all_fail(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+
+    def always_fail(object_name):
+        raise RuntimeError(f'boom-{object_name}')
+
+    fake_storage.delete_hook = always_fail
+    response = client.post(
+        '/objects/batch-delete',
+        json={'object_names': ['alpha.txt', 'beta.txt']},
+    )
+    assert response.status_code == 500
+    payload = response.json()
+    assert payload['ok'] is False
+    assert payload['requested_count'] == 2
+    assert payload['deleted_count'] == 0
+    assert payload['failed_count'] == 2
+    assert payload['failed'] == [
+        {'object_name': 'alpha.txt', 'detail': '异常信息：boom-alpha.txt'},
+        {'object_name': 'beta.txt', 'detail': '异常信息：boom-beta.txt'},
+    ]

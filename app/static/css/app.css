@@ -163,6 +163,36 @@ p {
   gap: 16px;
 }
 
+.panel-header-list-actions {
+  align-items: center;
+}
+
+.list-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.batch-delete-toolbar {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  border-radius: 999px;
+  background: rgba(227, 244, 255, 0.92);
+  border: 1px solid rgba(51, 166, 255, 0.14);
+  min-height: 44px;
+}
+
+.batch-delete-selection {
+  color: var(--primary-strong);
+  font-weight: 700;
+  font-size: 0.9rem;
+}
+
 .stack-form {
   display: grid;
   gap: 14px;
@@ -404,6 +434,56 @@ p {
   align-items: start;
 }
 
+.object-row-shell-selectable {
+  grid-template-columns: 30px minmax(0, 1fr) 68px;
+}
+
+.object-select-control {
+  display: inline-flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 2px;
+  cursor: pointer;
+}
+
+.object-select-checkbox {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.object-select-box {
+  width: 20px;
+  height: 20px;
+  border-radius: 8px;
+  border: 1px solid rgba(51, 166, 255, 0.25);
+  background: rgba(255, 255, 255, 0.95);
+  box-shadow: inset 0 1px 1px rgba(18, 50, 74, 0.04);
+  transition: background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.object-select-checkbox:checked + .object-select-box {
+  background: linear-gradient(135deg, var(--primary) 0%, var(--primary-strong) 100%);
+  border-color: transparent;
+  box-shadow: 0 8px 18px rgba(30, 119, 189, 0.16);
+}
+
+.object-select-checkbox:checked + .object-select-box::after {
+  content: "";
+  display: block;
+  width: 6px;
+  height: 11px;
+  margin: 2px 0 0 6px;
+  border: solid #fff;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+.object-select-checkbox:focus-visible + .object-select-box {
+  outline: none;
+  box-shadow: 0 0 0 4px rgba(51, 166, 255, 0.14);
+}
+
 .object-row-main {
   display: flex;
   align-items: flex-start;
@@ -506,8 +586,9 @@ p {
 }
 
 .toolbar-link:disabled {
-  cursor: wait;
-  opacity: 0.72;
+  cursor: not-allowed;
+  opacity: 0.58;
+  filter: saturate(0.82);
 }
 
 .object-meta-grid {
@@ -634,6 +715,11 @@ img {
     flex-direction: column;
   }
 
+  .list-header-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
   .page-shell {
     padding: 18px 14px 28px;
   }
@@ -714,6 +800,22 @@ img {
   .object-row-shell {
     grid-template-columns: 1fr 56px;
     gap: 10px;
+  }
+
+  .object-row-shell-selectable {
+    grid-template-columns: 24px 1fr 56px;
+  }
+
+  .object-select-box {
+    width: 18px;
+    height: 18px;
+    border-radius: 7px;
+  }
+
+  .object-select-checkbox:checked + .object-select-box::after {
+    width: 5px;
+    height: 9px;
+    margin: 2px 0 0 5px;
   }
 
   .object-row-main {

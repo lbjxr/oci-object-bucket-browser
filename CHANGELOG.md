@@ -21,8 +21,8 @@ All notable changes to this project will be documented in this file.
 - Default multipart parallelism changed from `4` to `6`.
 - Multipart browser upload implementation changed from `fetch` to `XMLHttpRequest` to expose real-time upload progress.
 - Upload speed display changed to a recent `3-second` sliding-window average for more realistic UX.
-- Single-object delete UX now keeps the current filtered list context, removes the deleted row inline first, and avoids an immediate hard page reload.
-- Delete success / failure messages now include clearer object-specific details.
+- Delete UX now supports multi-select batch delete, current-result select-all / clear, visible selected-count feedback, keeps the current filtered list context, removes successfully deleted rows inline first, and avoids an immediate hard page reload.
+- Delete success / failure messages now include clearer object-specific details, including partial-failure feedback for batch delete.
 - README updated with deployment guidance, proxy/Cloudflare advice, resumable upload notes, benchmark notes, delete support, and current recommended defaults.
 
 ### Fixed
@@ -31,6 +31,7 @@ All notable changes to this project will be documented in this file.
 - Fixed failed-part handling so only failed parts retry, without polluting already uploaded state.
 - Fixed resume flow so previously uploaded parts can be skipped correctly after retry/reselect.
 - Fixed object delete flow so uploaded test files can be removed directly from the UI.
+- Fixed bulk delete flow so successful objects are removed inline even when part of the batch fails.
 
 ### Benchmarks
 - With `16 MiB` chunks and `6` parallel uploads, a `382,938,704 bytes` sample file completed in about `130 seconds` from `init` to `complete`.

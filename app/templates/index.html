@@ -63,18 +63,32 @@
 </div>
 
 <section class="card panel table-panel">
-  <div class="panel-header panel-header-inline">
+  <div class="panel-header panel-header-inline panel-header-list-actions">
     <div>
       <h2>对象列表</h2>
       <p>{% if prefix %}当前前缀：<code>{{ prefix }}</code>{% else %}展示 bucket 当前可见对象{% endif %}</p>
     </div>
-    <span class="pill">共 {{ objects|length }} 项</span>
+    <div class="list-header-actions">
+      {% if objects %}
+      <div id="batch-delete-toolbar" class="batch-delete-toolbar" aria-live="polite">
+        <span id="batch-delete-selection" class="batch-delete-selection">已选 0 项</span>
+        <button id="batch-delete-select-all" class="toolbar-link" type="button">全选当前结果</button>
+        <button id="batch-delete-clear" class="toolbar-link" type="button" disabled>清空选择</button>
+        <button id="batch-delete-button" class="toolbar-link toolbar-link-danger" type="button" disabled>批量删除</button>
+      </div>
+      {% endif %}
+      <span class="pill">共 {{ objects|length }} 项</span>
+    </div>
   </div>
 
-  <div id="object-list" class="object-list single-list">
+  <div id="object-list" class="object-list single-list" data-current-prefix="{{ prefix }}">
     {% for obj in objects %}
     <article class="object-card object-card-unified object-row-card" data-object-row data-object-name="{{ obj.name }}">
-      <div class="object-row-shell">
+      <div class="object-row-shell object-row-shell-selectable">
+        <label class="object-select-control" aria-label="选择 {{ obj.name }}">
+          <input class="object-select-checkbox js-object-select" type="checkbox" value="{{ obj.name }}" data-object-name="{{ obj.name }}">
+          <span class="object-select-box" aria-hidden="true"></span>
+        </label>
         <div class="object-row-main">
           <div class="object-main">
             <div class="object-name">{{ obj.name }}</div>
@@ -114,6 +128,11 @@
   const objectList = document.getElementById('object-list');
   const objectCountPill = document.querySelector('.pill');
   const deleteFeedbackBox = document.getElementById('object-delete-feedback');
+  const batchDeleteToolbar = document.getElementById('batch-delete-toolbar');
+  const batchDeleteSelection = document.getElementById('batch-delete-selection');
+  const batchDeleteButton = document.getElementById('batch-delete-button');
+  const batchDeleteSelectAll = document.getElementById('batch-delete-select-all');
+  const batchDeleteClear = document.getElementById('batch-delete-clear');
   const form = document.getElementById('upload-form');
   if (!form) return;
   const fileInput = document.getElementById('file');
@@ -178,6 +197,12 @@
 
   const hideDeleteFeedback = () => deleteFeedbackBox.classList.add('hidden');
 
+  const getObjectRow = (objectName) => objectList ? objectList.querySelector(`[data-object-row][data-object-name="${CSS.escape(objectName)}"]`) : null;
+
+  const getSelectBoxes = () => objectList ? Array.from(objectList.querySelectorAll('.js-object-select')) : [];
+
+  const getSelectedObjectNames = () => getSelectBoxes().filter((input) => input.checked && !input.disabled).map((input) => input.value);
+
   const updateObjectCount = () => {
     if (!objectCountPill || !objectList) return;
     const count = objectList.querySelectorAll('[data-object-row]').length;
@@ -189,6 +214,19 @@
     const remainingRows = objectList.querySelectorAll('[data-object-row]');
     if (remainingRows.length > 0) return;
     objectList.innerHTML = '<div class="empty-state">这里还没有对象，或者当前前缀下没有结果。</div>';
+  };
+
+  const syncBatchDeleteToolbar = () => {
+    if (!batchDeleteToolbar || !batchDeleteSelection || !batchDeleteButton) return;
+    const boxes = getSelectBoxes();
+    const selected = boxes.filter((input) => input.checked && !input.disabled);
+    const enabledCount = boxes.filter((input) => !input.disabled).length;
+    const count = selected.length;
+    batchDeleteSelection.textContent = `已选 ${count} 项`;
+    batchDeleteButton.disabled = count === 0;
+    if (batchDeleteClear) batchDeleteClear.disabled = count === 0;
+    if (batchDeleteSelectAll) batchDeleteSelectAll.disabled = enabledCount === 0 || count === enabledCount;
+    batchDeleteToolbar.classList.toggle('hidden', boxes.length === 0);
   };
 
   const resetSpeedSamples = () => {
@@ -250,7 +288,9 @@
     const payload = contentType.includes('application/json') ? await response.json() : await response.text();
     if (!response.ok) {
       const detail = typeof payload === 'string' ? payload : payload.detail || payload.message || `HTTP ${response.status}`;
-      throw new Error(detail);
+      const error = new Error(detail);
+      error.payload = typeof payload === 'string' ? null : payload;
+      throw error;
     }
     return payload;
   };
@@ -420,64 +460,136 @@
         reject(new Error('上传已取消'));
       });
 
-      xhr.open('PUT', `/api/uploads/${currentUploadId}/part/${partNum}`, true);
+      xhr.open('PUT', `/api/uploads/${encodeURIComponent(currentUploadId)}/part/${partNum}`, true);
       xhr.timeout = 10 * 60 * 1000;
-      xhr.withCredentials = true;
       xhr.setRequestHeader('Content-Type', 'application/octet-stream');
       xhr.send(blob);
     });
 
     const uploadOnePart = async (partNum) => {
-      for (let attempt = 1; attempt <= MAX_PART_RETRIES; attempt += 1) {
-        if (currentAbort) throw new Error('上传已取消');
+      let attempt = 0;
+      while (attempt < MAX_PART_RETRIES) {
+        attempt += 1;
         try {
           return await uploadOnePartOnce(partNum);
         } catch (error) {
-          if (currentAbort || attempt >= MAX_PART_RETRIES || String(error.message || '').includes('已取消')) {
+          if (currentAbort) throw error;
+          if (attempt >= MAX_PART_RETRIES) {
             throw new Error(`分片 ${partNum} 上传失败，已重试 ${attempt} 次：${error.message || error}`);
           }
-          const delayMs = PART_RETRY_BASE_DELAY_MS * attempt;
-          detailEl.textContent = `分片 ${partNum}/${totalParts} 上传失败，${Math.round(delayMs / 1000)} 秒后重试（${attempt}/${MAX_PART_RETRIES}）`;
-          etaEl.textContent = 'ETA 重试后重新估算中';
-          await sleep(delayMs);
+          detailEl.textContent = `分片 ${partNum} 第 ${attempt} 次失败，准备重试...`;
+          await sleep(PART_RETRY_BASE_DELAY_MS * attempt);
         }
       }
-      throw new Error(`分片 ${partNum} 上传失败：重试次数已耗尽`);
+      throw new Error(`分片 ${partNum} 上传失败`);
     };
 
-    let cursor = 0;
     const workers = Array.from({length: parallelism}, async () => {
-      while (cursor < partQueue.length) {
+      while (partQueue.length > 0) {
         if (currentAbort) throw new Error('上传已取消');
-        const current = partQueue[cursor];
-        cursor += 1;
-        await uploadOnePart(current);
+        const partNum = partQueue.shift();
+        if (!partNum) return;
+        await uploadOnePart(partNum);
       }
     });
 
     await Promise.all(workers);
-    const complete = await jsonFetch(`/api/uploads/${currentUploadId}/complete`, {method: 'POST'});
-    percentEl.textContent = '100%';
-    speedEl.textContent = '完成';
+    detailEl.textContent = '分片上传完成，正在合并...';
+    const completed = await jsonFetch(`/api/uploads/${encodeURIComponent(currentUploadId)}/complete`, {
+      method: 'POST',
+    });
+    updateProgress({loaded: file.size, total: file.size, strategy: 'OCI multipart 分片并发上传'});
+    detailEl.textContent = '上传完成';
     etaEl.textContent = 'ETA 0秒';
-    barEl.style.width = '100%';
-    detailEl.textContent = '所有分片已上传并完成合并';
-    return complete;
+    return completed;
   };
 
-  fileInput.addEventListener('change', async () => {
-    const file = fileInput.files && fileInput.files[0];
-    if (!file) return;
+  const removeObjectRows = (objectNames) => {
+    const uniqueNames = Array.from(new Set(objectNames));
+    uniqueNames.forEach((objectName) => {
+      const row = getObjectRow(objectName);
+      if (!row) return;
+      row.classList.add('object-card-deleting');
+      window.setTimeout(() => {
+        row.remove();
+        updateObjectCount();
+        ensureEmptyState();
+        syncBatchDeleteToolbar();
+      }, 220);
+    });
+  };
+
+  const setRowPending = (objectNames, pending = true) => {
+    objectNames.forEach((objectName) => {
+      const row = getObjectRow(objectName);
+      if (!row) return;
+      row.classList.toggle('object-card-pending-delete', pending);
+    });
+  };
+
+  const setSelectedInputsDisabled = (objectNames, disabled = true) => {
+    const boxes = getSelectBoxes();
+    objectNames.forEach((objectName) => {
+      const input = boxes.find((box) => box.value === objectName);
+      if (!input) return;
+      input.disabled = disabled;
+      if (disabled) input.checked = false;
+    });
+    syncBatchDeleteToolbar();
+  };
+
+  const handleBatchDelete = async () => {
+    const selected = getSelectedObjectNames();
+    if (selected.length === 0) return;
+    const ok = window.confirm(`确认批量删除已选中的 ${selected.length} 个对象吗？删除后不可恢复。`);
+    if (!ok) return;
+
     hideSuccess();
     hideDeleteFeedback();
-    showStatus();
-    percentEl.textContent = '0%';
-    speedEl.textContent = '0 KB/s';
-    etaEl.textContent = 'ETA --';
-    strategyEl.textContent = file.size <= MULTIPART_THRESHOLD ? '策略：单请求直传' : '策略：OCI multipart 分片并发上传';
-    detailEl.textContent = `已选择：${file.name}（${fmtBytes(file.size)}）`;
-    filePickerHint.textContent = `${file.name} · ${fmtBytes(file.size)}`;
-    barEl.style.width = '0%';
+    batchDeleteButton.disabled = true;
+    batchDeleteClear.disabled = true;
+    const originBatchText = batchDeleteButton.textContent;
+    batchDeleteButton.textContent = '删除中...';
+    setRowPending(selected, true);
+    setSelectedInputsDisabled(selected, true);
+
+    try {
+      const result = await jsonFetch('/objects/batch-delete', {
+        method: 'POST',
+        body: JSON.stringify({object_names: selected}),
+      });
+      removeObjectRows(result.deleted || []);
+      showDeleteFeedback(`✅ ${result.message || `已删除 ${result.deleted_count || 0} 个对象`}`, 'success');
+    } catch (error) {
+      const message = error.message || String(error);
+      let responsePayload = null;
+      if (error && typeof error === 'object' && 'payload' in error) {
+        responsePayload = error.payload;
+      }
+      if (responsePayload && Array.isArray(responsePayload.deleted) && responsePayload.deleted.length > 0) {
+        removeObjectRows(responsePayload.deleted);
+        const failedNames = Array.isArray(responsePayload.failed)
+          ? responsePayload.failed.map((item) => item.object_name).filter(Boolean)
+          : [];
+        showDeleteFeedback(
+          `⚠️ ${responsePayload.message || '部分对象删除失败'}${failedNames.length ? `；失败：${failedNames.join('、')}` : ''}`,
+          'error'
+        );
+      } else {
+        setRowPending(selected, false);
+        showDeleteFeedback(`删除失败：${message}`, 'error');
+      }
+    } finally {
+      batchDeleteButton.textContent = originBatchText;
+      batchDeleteClear.disabled = false;
+      syncBatchDeleteToolbar();
+    }
+  };
+
+  fileInput.addEventListener('change', () => {
+    const file = fileInput.files && fileInput.files[0];
+    filePickerHint.textContent = file ? `${file.name}（${fmtBytes(file.size)}）` : '点击选择要上传的对象';
+    hideSuccess();
   });
 
   cancelBtn.addEventListener('click', async () => {
@@ -498,6 +610,39 @@
     strategyEl.textContent = '策略：已取消';
     setIdle();
   });
+
+  if (objectList) {
+    objectList.addEventListener('change', (event) => {
+      if (!(event.target instanceof HTMLInputElement)) return;
+      if (!event.target.classList.contains('js-object-select')) return;
+      hideDeleteFeedback();
+      syncBatchDeleteToolbar();
+    });
+  }
+
+  if (batchDeleteSelectAll) {
+    batchDeleteSelectAll.addEventListener('click', () => {
+      getSelectBoxes().forEach((input) => {
+        if (!input.disabled) input.checked = true;
+      });
+      hideDeleteFeedback();
+      syncBatchDeleteToolbar();
+    });
+  }
+
+  if (batchDeleteClear) {
+    batchDeleteClear.addEventListener('click', () => {
+      getSelectBoxes().forEach((input) => {
+        if (!input.disabled) input.checked = false;
+      });
+      hideDeleteFeedback();
+      syncBatchDeleteToolbar();
+    });
+  }
+
+  if (batchDeleteButton) {
+    batchDeleteButton.addEventListener('click', handleBatchDelete);
+  }
 
   deleteButtons.forEach((button) => {
     button.addEventListener('click', async () => {
@@ -520,6 +665,7 @@
             objectRow.remove();
             updateObjectCount();
             ensureEmptyState();
+            syncBatchDeleteToolbar();
           }, 220);
         }
         const detailMessage = result.detail || `对象“${objectName}”已从当前列表移除。`;
@@ -567,6 +713,8 @@
       setIdle();
     }
   });
+
+  syncBatchDeleteToolbar();
 })();
 </script>
 {% endblock %}
