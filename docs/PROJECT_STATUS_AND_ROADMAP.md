@@ -2,17 +2,19 @@
 
 ## Current status
 
-`oci-object-bucket-browser` is now in a practical **v1.0.0** state.
+`oci-object-bucket-browser` is now beyond basic MVP stage.
 
-It is no longer just an MVP demo page. It already works as a lightweight OCI Object Storage web panel for real-world self-use and small internal scenarios.
+It already works as a practical lightweight OCI Object Storage web panel for self-use and small internal scenarios, with usable upload, download, delete, and browsing flows.
 
-### What is already working
+## What is already working
 
-#### Core panel features
+### Core panel features
 - Single-account login.
 - Object listing.
 - Prefix filtering.
+- Lightweight prefix navigation.
 - Object download.
+- Batch download.
 - Text preview.
 - Image preview.
 - PDF preview.
@@ -21,20 +23,33 @@ It is no longer just an MVP demo page. It already works as a lightweight OCI Obj
 - Mobile-friendly layout.
 - `systemd` deployment.
 
-#### Upload features
+### Upload features
 - Small-file direct upload.
 - Large-file multipart upload.
 - Multipart parallel upload.
 - Lightweight resumable upload.
 - Upload cancel.
 - Progress, speed, ETA, success prompt.
-- Basic failed-part auto retry.
+- Smarter failed-part retry classification.
+- OCI `429` / throttling retry-after handling.
+- Temporary multipart concurrency reduction after repeated throttling.
+- OCI-side multipart reconciliation on resume.
+- Conservative degraded resume when remote reconciliation is temporarily unavailable.
 
-#### Object management
+### Object management
 - Single-object delete from the list.
-- Confirmation before delete.
-- Clearer inline delete success / failure feedback.
+- Batch delete.
+- Current-result select-all / clear.
+- Selected-count feedback.
 - Inline row removal after successful delete while keeping current filter context.
+- Folded failed-object feedback for long delete-failure lists.
+
+### Download features
+- Lightweight ZIP-based batch download.
+- Partial batch-download tolerance: successful objects still export even if some objects fail.
+- ZIP failure manifests (`_batch_download_failures.json` / `_batch_download_failures.txt`).
+- Native browser-triggered batch download flow for better large-ZIP reliability.
+- Range-based single-object download support for resumable / multi-thread-capable clients.
 
 ## Current recommended defaults
 
@@ -49,88 +64,36 @@ It is no longer just an MVP demo page. It already works as a lightweight OCI Obj
 - Multipart completion is stable after the upload-session write-loss fix.
 - Current speed display is more realistic after moving to a recent sliding-window average.
 - Object delete is now available for cleaning uploaded test files directly from the UI.
+- Batch download is now usable for everyday “select a few / a few dozen objects and package them” scenarios.
+- Native browser batch-download triggering is more reliable than the older blob-based frontend trigger for larger ZIP responses.
 
-## Known boundaries in v1.0.0
+## Known boundaries in current state
 
 - Resume support is lightweight, not full cloud-drive-grade resumable upload.
-- Retry policy is still a basic first version.
-- No OCI-side multipart reconciliation after restart yet.
-- No batch object actions yet.
-- No rename / move feature yet.
+- Retry policy is smarter than before, but still remains a relatively lightweight browser-led implementation.
+- Multipart throttling recovery currently reduces concurrency conservatively within the session and does not yet implement full adaptive recovery.
+- Batch ZIP download is still synchronous, not background-task-based.
+- Batch ZIP download is not a true resumable download format; if the browser connection drops, the ZIP usually needs to be regenerated.
+- Single-object download currently supports single-range requests, not multi-part `multipart/byteranges` responses.
+- Prefix navigation is intentionally lightweight and inferred from current object results, not a heavy real directory tree.
+- Rich object-detail expansion (P5) is intentionally postponed for now.
 
-## Next task list
+## Current next-step posture
 
-The following phases remain the active next-step task list.
+The current project posture is:
 
-### Phase 1 — short-term polish and usability
-
-#### P1.1 Delete workflow polish (highest priority in this phase)
-Deletion is already available and the latest iteration already improved this line with clearer feedback, inline row removal, and filter-context retention.
-
-Suggested follow-up:
-- Consider optional undo-style affordance if later needed.
-- Consider lightweight protection for dangerous names or folders if later needed.
-- Consider more structured error typing if OCI returns richer delete failures.
-
-#### P1.2 Changelog / release-note maintenance
-- Keep `CHANGELOG.md` updated after each meaningful iteration.
-- Keep release notes aligned with actual shipped behavior.
-
-#### P1.3 UI wording polish
-- Clarify terms like “current speed” vs. “average speed”.
-- Reduce ambiguity in upload / retry / delete states.
-
-### Phase 2 — upload reliability and diagnostics
-
-#### P2.1 Smarter retry policy
-- Different retry behavior for timeout / connection reset / 5xx.
-- Better retry messages.
-- Optional retry cap tuning via config.
-
-#### P2.2 Multipart reconciliation
-- Query OCI multipart parts when needed.
-- Reconcile local session metadata with remote uploaded parts.
-- Improve restart-time recovery confidence.
-
-#### P2.3 Better observability
-- Record upload start / finish / commit timing.
-- Make average throughput calculation easier to verify.
-- Improve debug visibility for slow or failed uploads.
-
-### Phase 3 — richer object-management experience
-
-#### P3.1 Batch object actions
-- Batch delete.
-- Batch download helpers.
-- Multi-select object operations.
-
-#### P3.2 Richer object metadata view
-- ETag.
-- Last-Modified.
-- Storage tier.
-- Custom metadata.
-
-#### P3.3 Stronger browsing model
-- Better pseudo-directory experience.
-- More intuitive navigation for large buckets.
-- Optional directory-tree style browsing.
+- Upload reliability: already significantly improved and no longer the immediate emergency pain point.
+- Batch delete / cleanup UX: already practical.
+- Batch download: now practical and more robust after switching to native browser download flow.
+- Prefix browsing: improved enough to feel more folder-like without adding a heavy tree.
+- Rich object detail expansion (P5): intentionally deferred.
 
 ## Priority summary
 
-If only one next step is chosen, it should be:
+If the project stays in a stabilization posture for now, that is fully reasonable.
 
-> **Continue improving object deletion UX first**
+The current version already supports:
 
-Reason:
-- It solves an immediate real cleanup need.
-- It is already partially implemented.
-- It has direct value after upload testing.
-- It is lower risk than more complex multipart engineering.
+> upload, resume, delete, batch delete, batch download, resumable single-object download, and lightweight prefix-based browsing
 
-After that, the best technical next step is:
-
-> **Upload reliability / diagnostics improvements**
-
-And only then:
-
-> **Richer object-management UX such as batch actions and stronger browsing**
+The next major additions should be driven by real usage needs rather than by feature pressure alone.

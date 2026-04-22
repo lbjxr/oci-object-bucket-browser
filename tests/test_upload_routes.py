@@ -203,6 +203,36 @@ def test_batch_download_returns_zip_of_selected_objects(tmp_path):
 
 
 
+def test_batch_download_accepts_form_post_for_native_browser_download(tmp_path):
+    import io
+    import zipfile
+
+    client, fake_storage = make_client(tmp_path)
+    fake_storage.download_payloads = {
+        'docs/a.txt': b'hello-a',
+        'images/b.png': b'hello-b',
+    }
+
+    response = client.post(
+        '/objects/batch-download',
+        data={
+            'prefix': 'docs/',
+            'object_names': ['docs/a.txt', 'images/b.png', 'docs/a.txt'],
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers['content-type'].startswith('application/zip')
+    assert 'attachment; filename="oci-batch-docs-2items-' in response.headers['content-disposition']
+    assert response.headers['x-batch-requested-count'] == '2'
+    assert response.headers['x-batch-archived-count'] == '2'
+    assert response.headers['x-batch-failed-count'] == '0'
+    assert response.headers['x-batch-partial'] == '0'
+
+    archive = zipfile.ZipFile(io.BytesIO(response.content))
+    assert sorted(archive.namelist()) == ['docs/a.txt', 'images/b.png']
+
+
+
 def test_batch_download_skips_failed_objects_and_emits_failure_manifest(tmp_path):
     import io
     import json as _json
@@ -392,6 +422,14 @@ def test_upload_part_returns_existing_etag_when_part_already_uploaded(tmp_path):
 def test_batch_download_requires_selection(tmp_path):
     client, _ = make_client(tmp_path)
     response = client.post('/objects/batch-download', json={'object_names': []})
+    assert response.status_code == 400
+    assert response.json()['detail'] == '至少要选择一个对象'
+
+
+
+def test_batch_download_form_requires_selection(tmp_path):
+    client, _ = make_client(tmp_path)
+    response = client.post('/objects/batch-download', data={'prefix': 'docs/'})
     assert response.status_code == 400
     assert response.json()['detail'] == '至少要选择一个对象'
 

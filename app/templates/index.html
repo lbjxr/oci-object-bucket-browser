@@ -128,6 +128,11 @@
 </section>
 
 <div id="object-delete-feedback" class="alert hidden" aria-live="polite"></div>
+<form id="batch-download-form" action="/objects/batch-download" method="post" target="batch-download-frame" class="hidden" aria-hidden="true">
+  <input type="hidden" name="prefix" value="{{ prefix }}">
+  <div id="batch-download-hidden-inputs"></div>
+</form>
+<iframe id="batch-download-frame" name="batch-download-frame" class="hidden" title="批量下载"></iframe>
 <template id="batch-delete-feedback-template">
   <div class="delete-feedback-summary"></div>
   <div class="delete-feedback-meta hidden">
@@ -156,6 +161,8 @@
   const batchDownloadButton = document.getElementById('batch-download-button');
   const batchDeleteSelectAll = document.getElementById('batch-delete-select-all');
   const batchDeleteClear = document.getElementById('batch-delete-clear');
+  const batchDownloadForm = document.getElementById('batch-download-form');
+  const batchDownloadHiddenInputs = document.getElementById('batch-download-hidden-inputs');
   const form = document.getElementById('upload-form');
   if (!form) return;
   const fileInput = document.getElementById('file');
@@ -756,9 +763,10 @@
     syncBatchDeleteToolbar();
   };
 
-  const triggerBatchDownload = async () => {
+  const triggerBatchDownload = () => {
     const selected = getSelectedObjectNames();
     if (selected.length === 0) return;
+    if (!batchDownloadForm || !batchDownloadHiddenInputs) return;
 
     hideSuccess();
     hideDeleteFeedback();
@@ -766,39 +774,24 @@
     batchDownloadButton.disabled = true;
     batchDeleteButton.disabled = true;
     if (batchDeleteClear) batchDeleteClear.disabled = true;
-    batchDownloadButton.textContent = '打包中...';
+    batchDownloadButton.textContent = '准备下载...';
+
+    const currentPrefix = objectList?.dataset.currentPrefix || '';
+    const prefixInput = batchDownloadForm.querySelector('input[name="prefix"]');
+    if (prefixInput) prefixInput.value = currentPrefix;
+
+    batchDownloadHiddenInputs.innerHTML = '';
+    selected.forEach((objectName) => {
+      const input = document.createElement('input');
+      input.type = 'hidden';
+      input.name = 'object_names';
+      input.value = objectName;
+      batchDownloadHiddenInputs.appendChild(input);
+    });
 
     try {
-      const currentPrefix = objectList?.dataset.currentPrefix || '';
-      const response = await fetch(`/objects/batch-download?prefix=${encodeURIComponent(currentPrefix)}`, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({object_names: selected}),
-      });
-
-      if (!response.ok) {
-        const contentType = response.headers.get('content-type') || '';
-        if (contentType.includes('application/json')) {
-          const payload = await response.json();
-          throw new Error(payload.detail || payload.message || `HTTP ${response.status}`);
-        }
-        throw new Error(await response.text() || `HTTP ${response.status}`);
-      }
-
-      const blob = await response.blob();
-      const disposition = response.headers.get('content-disposition') || '';
-      const filenameMatch = disposition.match(/filename="([^"]+)"/i);
-      const filename = filenameMatch ? filenameMatch[1] : `oci-batch-${selected.length}.zip`;
-      const objectUrl = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = objectUrl;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.setTimeout(() => window.URL.revokeObjectURL(objectUrl), 1000);
-      showDeleteFeedback(`✅ 已开始下载打包文件：${filename}`, 'success');
+      batchDownloadForm.submit();
+      showDeleteFeedback('✅ 已提交批量下载，浏览器将直接接管 ZIP 下载；若有部分失败，压缩包内会附失败清单。', 'success');
     } catch (error) {
       showDeleteFeedback(`批量下载失败：${error.message || error}`, 'error');
     } finally {
