@@ -7,6 +7,11 @@ import oci
 from oci.config import validate_config
 from oci.exceptions import ConfigFileNotFound, InvalidConfig, ServiceError
 from oci.object_storage import ObjectStorageClient
+from oci.object_storage.models import (
+    CommitMultipartUploadDetails,
+    CommitMultipartUploadPartDetails,
+    CreateMultipartUploadDetails,
+)
 
 from app.config import Settings, get_settings
 from app.models import ObjectEntry, PreviewData
@@ -66,18 +71,120 @@ class OCIStorageService:
         return entries
 
     def upload_file(self, object_name: str, fileobj: BinaryIO, content_type: str | None = None) -> None:
-        body = fileobj.read()
         content_type = guess_content_type(object_name, content_type)
         try:
+            if hasattr(fileobj, "seek"):
+                fileobj.seek(0)
             self.client.put_object(
                 self.namespace,
                 self.bucket_name,
                 object_name,
-                body,
+                fileobj,
                 content_type=content_type,
             )
         except ServiceError as exc:
             raise OCIStorageError(f"上传失败: {exc.message}") from exc
+        except Exception as exc:
+            raise OCIStorageError(f"上传失败: {exc}") from exc
+
+    def create_multipart_upload(self, object_name: str, content_type: str | None = None) -> str:
+        content_type = guess_content_type(object_name, content_type)
+        try:
+            response = self.client.create_multipart_upload(
+                self.namespace,
+                self.bucket_name,
+                CreateMultipartUploadDetails(
+                    object=object_name,
+                    content_type=content_type,
+                ),
+            )
+            return response.data.upload_id
+        except ServiceError as exc:
+            raise OCIStorageError(f"创建分段上传失败: {exc.message}") from exc
+
+    def upload_part(
+        self,
+        *,
+        object_name: str,
+        multipart_upload_id: str,
+        part_num: int,
+        payload: bytes,
+        content_type: str | None = None,
+    ) -> str:
+        try:
+            response = self.client.upload_part(
+                self.namespace,
+                self.bucket_name,
+                object_name,
+                multipart_upload_id,
+                part_num,
+                BytesIO(payload),
+                content_length=len(payload),
+            )
+            etag = response.headers.get("etag") or getattr(response.data, "etag", None)
+            if not etag:
+                raise OCIStorageError("分片上传成功但未返回 ETag")
+            return etag
+        except ServiceError as exc:
+            raise OCIStorageError(f"上传分片失败（part {part_num}）: {exc.message}") from exc
+        except Exception as exc:
+            raise OCIStorageError(f"上传分片失败（part {part_num}）: {exc}") from exc
+
+    def list_multipart_uploaded_parts(self, *, object_name: str, multipart_upload_id: str) -> dict[int, str]:
+        page = None
+        parts: dict[int, str] = {}
+        try:
+            while True:
+                response = self.client.list_multipart_upload_parts(
+                    self.namespace,
+                    self.bucket_name,
+                    object_name,
+                    multipart_upload_id,
+                    limit=1000,
+                    page=page,
+                )
+                for item in response.data.parts:
+                    parts[int(item.part_num)] = item.etag
+                page = response.headers.get("opc-next-page")
+                if not page:
+                    break
+            return parts
+        except ServiceError as exc:
+            raise OCIStorageError(f"查询已上传分片失败: {exc.message}") from exc
+
+    def commit_multipart_upload(
+        self,
+        *,
+        object_name: str,
+        multipart_upload_id: str,
+        parts: list[tuple[int, str]],
+    ) -> None:
+        try:
+            self.client.commit_multipart_upload(
+                self.namespace,
+                self.bucket_name,
+                object_name,
+                multipart_upload_id,
+                CommitMultipartUploadDetails(
+                    parts_to_commit=[
+                        CommitMultipartUploadPartDetails(part_num=part_num, etag=etag)
+                        for part_num, etag in sorted(parts, key=lambda item: item[0])
+                    ]
+                ),
+            )
+        except ServiceError as exc:
+            raise OCIStorageError(f"合并分段上传失败: {exc.message}") from exc
+
+    def abort_multipart_upload(self, *, object_name: str, multipart_upload_id: str) -> None:
+        try:
+            self.client.abort_multipart_upload(
+                self.namespace,
+                self.bucket_name,
+                object_name,
+                multipart_upload_id,
+            )
+        except ServiceError as exc:
+            raise OCIStorageError(f"取消分段上传失败: {exc.message}") from exc
 
     def get_object(self, object_name: str):
         try:

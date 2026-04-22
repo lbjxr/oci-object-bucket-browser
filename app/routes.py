@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import hashlib
 import secrets
 from datetime import datetime
 from io import BytesIO
 from urllib.parse import quote
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi import APIRouter, Body, File, Form, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel
 
 from app.config import get_settings
 from app.oci_client import OCIStorageError, OCIStorageService
+from app.upload_sessions import UploadedPart, UploadSessionStore
 from app.utils import is_image_type, is_pdf_type, is_text_type, object_name_from_upload, to_data_url
 
 router = APIRouter()
@@ -64,6 +68,11 @@ def get_storage() -> OCIStorageService:
     return OCIStorageService()
 
 
+def get_upload_store() -> UploadSessionStore:
+    settings = get_settings()
+    return UploadSessionStore(settings.upload_session_dir)
+
+
 def require_login(request: Request) -> None:
     if not request.session.get("authenticated"):
         raise HTTPException(status_code=401, detail="未登录")
@@ -80,8 +89,23 @@ def template_context(request: Request, **extra: object) -> dict[str, object]:
         "app_title": "OCI Object Bucket Browser",
         "is_authenticated": bool(request.session.get("authenticated")),
         "auth_username": settings.auth_username,
+        "upload_chunk_size_mb": settings.upload_chunk_size_mb,
+        "upload_single_put_threshold_mb": settings.upload_single_put_threshold_mb,
+        "upload_parallelism": settings.upload_parallelism,
         **extra,
     }
+
+
+def build_upload_fingerprint(*, object_name: str, file_size: int, chunk_size: int, file_fingerprint: str) -> str:
+    payload = f"{object_name}|{file_size}|{chunk_size}|{file_fingerprint}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+class UploadInitRequest(BaseModel):
+    filename: str
+    file_size: int
+    content_type: str | None = None
+    file_fingerprint: str | None = None
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -140,17 +164,239 @@ def index(request: Request, prefix: str = ""):
 
 @router.post("/upload")
 async def upload(request: Request, file: UploadFile = File(...)):
+    is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
     if not request.session.get("authenticated"):
+        if is_ajax:
+            return JSONResponse({"detail": "未登录"}, status_code=401)
         return redirect_to_login(request.url.path)
     if not file.filename:
         raise HTTPException(status_code=400, detail="缺少文件名")
     object_name = object_name_from_upload(file.filename)
     try:
-        data = await file.read()
-        get_storage().upload_file(object_name, BytesIO(data), content_type=file.content_type)
+        await run_in_threadpool(get_storage().upload_file, object_name, file.file, file.content_type)
     except OCIStorageError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"上传过程中发生异常: {exc}") from exc
+    finally:
+        await file.close()
+    if is_ajax:
+        return JSONResponse(
+            {
+                "ok": True,
+                "strategy": "single-put",
+                "object_name": object_name,
+                "message": f"上传成功：{object_name}",
+            }
+        )
     return RedirectResponse(url="/", status_code=303)
+
+
+@router.post("/api/uploads/init")
+async def init_upload(request: Request, payload: UploadInitRequest = Body(...)):
+    require_login(request)
+    settings = get_settings()
+    if not payload.filename.strip():
+        raise HTTPException(status_code=400, detail="缺少文件名")
+    if payload.file_size <= 0:
+        raise HTTPException(status_code=400, detail="文件大小必须大于 0")
+
+    object_name = object_name_from_upload(payload.filename)
+    content_type = payload.content_type or "application/octet-stream"
+    chunk_size = settings.upload_chunk_size_mb * 1024 * 1024
+    threshold = settings.upload_single_put_threshold_mb * 1024 * 1024
+    file_fingerprint = (payload.file_fingerprint or f"{payload.filename}:{payload.file_size}").strip()
+    strategy = "single-put" if payload.file_size <= threshold else "oci-multipart-browser-chunked"
+    fingerprint = build_upload_fingerprint(
+        object_name=object_name,
+        file_size=payload.file_size,
+        chunk_size=chunk_size,
+        file_fingerprint=file_fingerprint,
+    )
+
+    store = get_upload_store()
+    existing = store.find_active_by_fingerprint(fingerprint)
+    if existing and existing.strategy == strategy:
+        return {
+            "ok": True,
+            "reused": True,
+            "upload_id": existing.upload_id,
+            "object_name": existing.object_name,
+            "content_type": existing.content_type,
+            "strategy": existing.strategy,
+            "chunk_size": existing.chunk_size,
+            "parallelism": existing.parallelism,
+            "uploaded_parts": existing.uploaded_part_numbers,
+            "uploaded_bytes": existing.uploaded_bytes,
+            "message": "已恢复之前未完成的上传会话",
+        }
+
+    multipart_upload_id = None
+    if strategy != "single-put":
+        multipart_upload_id = await run_in_threadpool(get_storage().create_multipart_upload, object_name, content_type)
+
+    session = store.create(
+        object_name=object_name,
+        content_type=content_type,
+        total_size=payload.file_size,
+        chunk_size=chunk_size,
+        parallelism=settings.upload_parallelism,
+        strategy=strategy,
+        fingerprint=fingerprint,
+        multipart_upload_id=multipart_upload_id,
+    )
+    return {
+        "ok": True,
+        "reused": False,
+        "upload_id": session.upload_id,
+        "object_name": session.object_name,
+        "content_type": session.content_type,
+        "strategy": session.strategy,
+        "chunk_size": session.chunk_size,
+        "parallelism": session.parallelism,
+        "uploaded_parts": session.uploaded_part_numbers,
+        "uploaded_bytes": session.uploaded_bytes,
+        "message": "已创建上传会话",
+    }
+
+
+@router.put("/api/uploads/{upload_id}/part/{part_num}")
+async def upload_part(request: Request, upload_id: str, part_num: int, body: bytes = Body(...)):
+    require_login(request)
+    if part_num <= 0:
+        raise HTTPException(status_code=400, detail="part_num 必须从 1 开始")
+
+    store = get_upload_store()
+    session = store.get(upload_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="上传会话不存在")
+    if session.completed:
+        raise HTTPException(status_code=409, detail="上传会话已完成")
+
+    if session.strategy == "single-put":
+        raise HTTPException(status_code=400, detail="当前上传会话不支持分片")
+    if not session.multipart_upload_id:
+        raise HTTPException(status_code=500, detail="缺少 OCI multipart upload id")
+
+    existing = session.uploaded_parts.get(part_num)
+    if existing and existing.size == len(body):
+        return {
+            "ok": True,
+            "upload_id": upload_id,
+            "part_num": part_num,
+            "etag": existing.etag,
+            "already_uploaded": True,
+        }
+
+    try:
+        etag = await run_in_threadpool(
+            get_storage().upload_part,
+            object_name=session.object_name,
+            multipart_upload_id=session.multipart_upload_id,
+            part_num=part_num,
+            payload=body,
+            content_type=session.content_type,
+        )
+    except OCIStorageError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"上传分片失败（part {part_num}）: {exc}") from exc
+
+    try:
+        store.update(
+            upload_id,
+            lambda s: s.uploaded_parts.__setitem__(part_num, UploadedPart(part_num=part_num, etag=etag, size=len(body))),
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="上传会话不存在")
+    return {
+        "ok": True,
+        "upload_id": upload_id,
+        "part_num": part_num,
+        "etag": etag,
+        "already_uploaded": False,
+    }
+
+
+@router.get("/api/uploads/{upload_id}")
+def get_upload_status(request: Request, upload_id: str):
+    require_login(request)
+    session = get_upload_store().get(upload_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="上传会话不存在")
+    return {
+        "ok": True,
+        "upload_id": session.upload_id,
+        "object_name": session.object_name,
+        "content_type": session.content_type,
+        "strategy": session.strategy,
+        "total_size": session.total_size,
+        "chunk_size": session.chunk_size,
+        "parallelism": session.parallelism,
+        "uploaded_parts": session.uploaded_part_numbers,
+        "uploaded_bytes": session.uploaded_bytes,
+        "completed": session.completed,
+        "multipart_upload_id": session.multipart_upload_id,
+    }
+
+
+@router.post("/api/uploads/{upload_id}/complete")
+async def complete_upload(request: Request, upload_id: str):
+    require_login(request)
+    store = get_upload_store()
+    session = store.get(upload_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="上传会话不存在")
+    if session.completed:
+        return {
+            "ok": True,
+            "upload_id": session.upload_id,
+            "object_name": session.object_name,
+            "strategy": session.strategy,
+            "message": f"上传完成：{session.object_name}",
+        }
+
+    storage = get_storage()
+    if session.strategy == "single-put":
+        raise HTTPException(status_code=400, detail="single-put 上传无需调用 complete 接口")
+
+    expected_parts = (session.total_size + session.chunk_size - 1) // session.chunk_size
+    missing = [part_num for part_num in range(1, expected_parts + 1) if part_num not in session.uploaded_parts]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"仍有分片未上传完成: {missing[:10]}")
+
+    await run_in_threadpool(
+        storage.commit_multipart_upload,
+        object_name=session.object_name,
+        multipart_upload_id=session.multipart_upload_id or "",
+        parts=[(part_num, session.uploaded_parts[part_num].etag) for part_num in session.uploaded_part_numbers],
+    )
+    session.completed = True
+    store.save(session)
+    return {
+        "ok": True,
+        "upload_id": session.upload_id,
+        "object_name": session.object_name,
+        "strategy": session.strategy,
+        "message": f"上传完成：{session.object_name}，所有分片已合并。",
+    }
+
+
+@router.delete("/api/uploads/{upload_id}")
+async def cancel_upload(request: Request, upload_id: str):
+    require_login(request)
+    store = get_upload_store()
+    session = store.get(upload_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="上传会话不存在")
+    if session.multipart_upload_id and not session.completed:
+        await run_in_threadpool(
+            get_storage().abort_multipart_upload,
+            object_name=session.object_name,
+            multipart_upload_id=session.multipart_upload_id,
+        )
+    store.delete(upload_id)
+    return {"ok": True, "message": "上传会话已取消"}
 
 
 @router.get("/download/{object_name:path}")

@@ -3,28 +3,46 @@
 {% block title %}对象列表 · {{ app_title }}{% endblock %}
 
 {% block content %}
-<section class="hero card compact-hero">
-  <div>
-    <p class="eyebrow">Object Storage</p>
-    <h1>Bucket 对象浏览</h1>
-    <p class="subtitle">上传、筛选、预览、下载，一页完成。</p>
-  </div>
-</section>
-
 {% if error %}
 <div class="alert alert-error">{{ error }}</div>
 {% endif %}
+
+<div id="upload-success" class="alert alert-success hidden" aria-live="polite"></div>
 
 <div class="grid two-columns form-grid">
   <section class="card panel compact-panel form-panel">
     <div class="panel-header">
       <h2>上传文件</h2>
-      <p>直接上传到当前 bucket。</p>
+      <p>小文件直传。大文件自动切成分片，并发传到 OCI multipart。</p>
     </div>
-    <form action="/upload" method="post" enctype="multipart/form-data" class="stack-form">
+    <form id="upload-form" action="/upload" method="post" enctype="multipart/form-data" class="stack-form">
       <label class="field-label" for="file">选择文件</label>
-      <input id="file" class="input-file" type="file" name="file" required>
-      <button class="button" type="submit">上传到 Bucket</button>
+      <label class="file-picker" for="file">
+        <span class="file-picker-button">选择文件</span>
+        <span id="file-picker-hint" class="file-picker-hint">点击选择要上传的对象</span>
+      </label>
+      <input id="file" class="input-file visually-hidden-file" type="file" name="file" required>
+      <div class="upload-strategy-note muted">
+        小于 {{ upload_single_put_threshold_mb }} MB 走单请求上传；更大的文件自动按 {{ upload_chunk_size_mb }} MB 分片，最多并发 {{ upload_parallelism }} 路。
+      </div>
+      <div id="upload-status" class="upload-status hidden" aria-live="polite">
+        <div class="upload-status-head">
+          <span id="upload-percent">0%</span>
+          <span id="upload-speed">0 KB/s</span>
+        </div>
+        <div class="upload-progress-track">
+          <div id="upload-progress-bar" class="upload-progress-bar"></div>
+        </div>
+        <div class="upload-detail-grid">
+          <div id="upload-detail" class="upload-detail">等待上传</div>
+          <div id="upload-eta" class="upload-detail">ETA --</div>
+          <div id="upload-strategy" class="upload-detail">策略：待确认</div>
+        </div>
+      </div>
+      <div class="button-row">
+        <button id="upload-submit" class="button" type="submit">上传到 Bucket</button>
+        <button id="upload-cancel" class="button button-secondary hidden" type="button">取消当前上传</button>
+      </div>
     </form>
   </section>
 
@@ -86,4 +104,404 @@
     {% endfor %}
   </div>
 </section>
+
+<script>
+(() => {
+  const form = document.getElementById('upload-form');
+  if (!form) return;
+  const fileInput = document.getElementById('file');
+  const filePickerHint = document.getElementById('file-picker-hint');
+  const submitBtn = document.getElementById('upload-submit');
+  const cancelBtn = document.getElementById('upload-cancel');
+  const statusBox = document.getElementById('upload-status');
+  const successBox = document.getElementById('upload-success');
+  const percentEl = document.getElementById('upload-percent');
+  const speedEl = document.getElementById('upload-speed');
+  const detailEl = document.getElementById('upload-detail');
+  const etaEl = document.getElementById('upload-eta');
+  const strategyEl = document.getElementById('upload-strategy');
+  const barEl = document.getElementById('upload-progress-bar');
+
+  const MULTIPART_THRESHOLD = {{ upload_single_put_threshold_mb|int }} * 1024 * 1024;
+  const FALLBACK_CHUNK_SIZE = {{ upload_chunk_size_mb|int }} * 1024 * 1024;
+  const FALLBACK_PARALLELISM = {{ upload_parallelism|int }};
+  const MAX_PART_RETRIES = 3;
+  const PART_RETRY_BASE_DELAY_MS = 800;
+
+  const activeControllers = new Set();
+  let currentUploadId = null;
+  let currentAbort = false;
+  let speedSamples = [];
+
+  const fmtBytes = (bytes) => {
+    if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    let val = bytes;
+    while (val >= 1024 && i < units.length - 1) {
+      val /= 1024;
+      i += 1;
+    }
+    return `${val.toFixed(val >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+  };
+
+  const fmtDuration = (seconds) => {
+    if (!Number.isFinite(seconds) || seconds < 0) return '--';
+    const rounded = Math.max(0, Math.round(seconds));
+    const h = Math.floor(rounded / 3600);
+    const m = Math.floor((rounded % 3600) / 60);
+    const s = rounded % 60;
+    if (h > 0) return `${h}小时${m}分`;
+    if (m > 0) return `${m}分${s}秒`;
+    return `${s}秒`;
+  };
+
+  const showStatus = () => statusBox.classList.remove('hidden');
+  const showSuccess = (message) => {
+    successBox.textContent = message;
+    successBox.classList.remove('hidden');
+  };
+  const hideSuccess = () => successBox.classList.add('hidden');
+
+  const resetSpeedSamples = () => {
+    speedSamples = [];
+  };
+
+  const computeSmoothedSpeed = (loaded) => {
+    const now = Date.now();
+    speedSamples.push({ ts: now, loaded });
+    const windowMs = 3000;
+    speedSamples = speedSamples.filter((sample) => now - sample.ts <= windowMs);
+    if (speedSamples.length < 2) return 0;
+    const first = speedSamples[0];
+    const last = speedSamples[speedSamples.length - 1];
+    const deltaBytes = Math.max(0, last.loaded - first.loaded);
+    const deltaSeconds = Math.max((last.ts - first.ts) / 1000, 0.001);
+    return deltaBytes / deltaSeconds;
+  };
+
+  const setIdle = () => {
+    submitBtn.disabled = false;
+    submitBtn.textContent = '上传到 Bucket';
+    cancelBtn.classList.add('hidden');
+    currentUploadId = null;
+    activeControllers.clear();
+    resetSpeedSamples();
+  };
+
+  const setBusy = () => {
+    submitBtn.disabled = true;
+    submitBtn.textContent = '上传中...';
+    cancelBtn.classList.remove('hidden');
+    resetSpeedSamples();
+  };
+
+  const updateProgress = ({ loaded, total, strategy }) => {
+    const percent = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+    const speed = computeSmoothedSpeed(loaded);
+    const remaining = Math.max(total - loaded, 0);
+    const eta = speed > 0 ? remaining / speed : Number.NaN;
+    percentEl.textContent = `${percent}%`;
+    speedEl.textContent = speed > 0 ? `${fmtBytes(speed)}/s` : '计算中...';
+    detailEl.textContent = `${fmtBytes(loaded)} / ${fmtBytes(total)}`;
+    etaEl.textContent = `ETA ${fmtDuration(eta)}`;
+    strategyEl.textContent = `策略：${strategy}`;
+    barEl.style.width = `${percent}%`;
+  };
+
+  const jsonFetch = async (url, options = {}) => {
+    const response = await fetch(url, {
+      credentials: 'same-origin',
+      headers: {
+        ...(options.body && !(options.body instanceof Blob) ? {'Content-Type': 'application/json'} : {}),
+        ...(options.headers || {}),
+      },
+      ...options,
+    });
+    const contentType = response.headers.get('content-type') || '';
+    const payload = contentType.includes('application/json') ? await response.json() : await response.text();
+    if (!response.ok) {
+      const detail = typeof payload === 'string' ? payload : payload.detail || payload.message || `HTTP ${response.status}`;
+      throw new Error(detail);
+    }
+    return payload;
+  };
+
+  const buildFingerprint = async (file) => {
+    const sample = file.slice(0, Math.min(file.size, 1024 * 1024));
+    const buffer = await sample.arrayBuffer();
+    const subtle = globalThis.crypto && globalThis.crypto.subtle;
+    if (subtle && typeof subtle.digest === 'function') {
+      const digest = await subtle.digest('SHA-256', buffer);
+      const hashHex = Array.from(new Uint8Array(digest)).map((x) => x.toString(16).padStart(2, '0')).join('');
+      return `${file.name}:${file.size}:${file.lastModified}:${hashHex}`;
+    }
+
+    const bytes = new Uint8Array(buffer);
+    let acc = 0;
+    const step = Math.max(1, Math.floor(bytes.length / 64));
+    for (let i = 0; i < bytes.length; i += step) {
+      acc = (acc * 131 + bytes[i]) >>> 0;
+    }
+    const fallbackHex = acc.toString(16).padStart(8, '0');
+    return `${file.name}:${file.size}:${file.lastModified}:${bytes.length}:${fallbackHex}`;
+  };
+
+  const uploadSingle = (file) => new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const data = new FormData();
+    data.append('file', file);
+    currentAbort = false;
+
+    xhr.upload.addEventListener('progress', (e) => {
+      if (!e.lengthComputable) return;
+      updateProgress({loaded: e.loaded, total: e.total, strategy: '单请求直传'});
+    });
+
+    xhr.addEventListener('load', () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText || '{}'));
+        } catch (_) {
+          resolve({message: '上传完成'});
+        }
+        return;
+      }
+      try {
+        const payload = JSON.parse(xhr.responseText || '{}');
+        reject(new Error(payload.detail || payload.message || `HTTP ${xhr.status}`));
+      } catch (_) {
+        reject(new Error(`HTTP ${xhr.status}`));
+      }
+    });
+
+    xhr.addEventListener('error', () => reject(new Error('上传失败：连接被中断，可能是代理或网络提前断开')));
+    xhr.addEventListener('timeout', () => reject(new Error('上传失败：请求超时')));
+    xhr.addEventListener('abort', () => reject(new Error('上传已取消')));
+    xhr.open('POST', form.action, true);
+    xhr.timeout = 10 * 60 * 1000;
+    xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
+    xhr.send(data);
+
+    activeControllers.add({abort: () => xhr.abort()});
+  });
+
+  const sleep = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
+
+  const uploadMultipart = async (file) => {
+    const fingerprint = await buildFingerprint(file);
+    const init = await jsonFetch('/api/uploads/init', {
+      method: 'POST',
+      body: JSON.stringify({
+        filename: file.name,
+        file_size: file.size,
+        content_type: file.type || 'application/octet-stream',
+        file_fingerprint: fingerprint,
+      }),
+    });
+
+    currentUploadId = init.upload_id;
+    const chunkSize = init.chunk_size || FALLBACK_CHUNK_SIZE;
+    const parallelism = Math.max(1, init.parallelism || FALLBACK_PARALLELISM);
+    const totalParts = Math.ceil(file.size / chunkSize);
+    const doneParts = new Set(init.uploaded_parts || []);
+    const partLoaded = new Map();
+    let loadedBase = 0;
+    if (doneParts.size > 0) {
+      for (const partNum of doneParts) {
+        const start = (partNum - 1) * chunkSize;
+        loadedBase += Math.max(0, Math.min(chunkSize, file.size - start));
+      }
+    }
+
+    const updateAggregateProgress = () => {
+      let inflightLoaded = 0;
+      for (const value of partLoaded.values()) inflightLoaded += value;
+      updateProgress({loaded: loadedBase + inflightLoaded, total: file.size, strategy: 'OCI multipart 分片并发上传'});
+    };
+
+    updateAggregateProgress();
+    detailEl.textContent = init.reused ? '已恢复未完成上传，继续补传剩余分片' : '已创建上传会话，开始并发上传分片';
+    if ((init.uploaded_parts || []).length > 0) {
+      etaEl.textContent = 'ETA 重新估算中';
+    }
+
+    const partQueue = [];
+    for (let partNum = 1; partNum <= totalParts; partNum += 1) {
+      if (!doneParts.has(partNum)) partQueue.push(partNum);
+    }
+
+    const uploadOnePartOnce = (partNum) => new Promise((resolve, reject) => {
+      const start = (partNum - 1) * chunkSize;
+      const end = Math.min(start + chunkSize, file.size);
+      const blob = file.slice(start, end);
+      const xhr = new XMLHttpRequest();
+      const controller = { abort: () => xhr.abort() };
+      activeControllers.add(controller);
+      partLoaded.set(partNum, 0);
+
+      xhr.upload.addEventListener('progress', (e) => {
+        if (!e.lengthComputable) return;
+        partLoaded.set(partNum, e.loaded);
+        updateAggregateProgress();
+        detailEl.textContent = `正在上传分片 ${partNum}/${totalParts}`;
+      });
+
+      xhr.addEventListener('load', () => {
+        activeControllers.delete(controller);
+        if (xhr.status >= 200 && xhr.status < 300) {
+          let payload = {};
+          try {
+            payload = JSON.parse(xhr.responseText || '{}');
+          } catch (_) {}
+          partLoaded.delete(partNum);
+          loadedBase += blob.size;
+          updateAggregateProgress();
+          detailEl.textContent = `分片 ${partNum}/${totalParts} 已上传`;
+          resolve(payload);
+          return;
+        }
+        partLoaded.delete(partNum);
+        updateAggregateProgress();
+        let detail = `HTTP ${xhr.status}`;
+        try {
+          const payload = JSON.parse(xhr.responseText || '{}');
+          detail = payload.detail || payload.message || detail;
+        } catch (_) {}
+        reject(new Error(detail));
+      });
+
+      xhr.addEventListener('error', () => {
+        activeControllers.delete(controller);
+        partLoaded.delete(partNum);
+        updateAggregateProgress();
+        reject(new Error(`分片 ${partNum} 上传失败：连接中断`));
+      });
+
+      xhr.addEventListener('timeout', () => {
+        activeControllers.delete(controller);
+        partLoaded.delete(partNum);
+        updateAggregateProgress();
+        reject(new Error(`分片 ${partNum} 上传失败：请求超时`));
+      });
+
+      xhr.addEventListener('abort', () => {
+        activeControllers.delete(controller);
+        partLoaded.delete(partNum);
+        updateAggregateProgress();
+        reject(new Error('上传已取消'));
+      });
+
+      xhr.open('PUT', `/api/uploads/${currentUploadId}/part/${partNum}`, true);
+      xhr.timeout = 10 * 60 * 1000;
+      xhr.withCredentials = true;
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.send(blob);
+    });
+
+    const uploadOnePart = async (partNum) => {
+      for (let attempt = 1; attempt <= MAX_PART_RETRIES; attempt += 1) {
+        if (currentAbort) throw new Error('上传已取消');
+        try {
+          return await uploadOnePartOnce(partNum);
+        } catch (error) {
+          if (currentAbort || attempt >= MAX_PART_RETRIES || String(error.message || '').includes('已取消')) {
+            throw new Error(`分片 ${partNum} 上传失败，已重试 ${attempt} 次：${error.message || error}`);
+          }
+          const delayMs = PART_RETRY_BASE_DELAY_MS * attempt;
+          detailEl.textContent = `分片 ${partNum}/${totalParts} 上传失败，${Math.round(delayMs / 1000)} 秒后重试（${attempt}/${MAX_PART_RETRIES}）`;
+          etaEl.textContent = 'ETA 重试后重新估算中';
+          await sleep(delayMs);
+        }
+      }
+      throw new Error(`分片 ${partNum} 上传失败：重试次数已耗尽`);
+    };
+
+    let cursor = 0;
+    const workers = Array.from({length: parallelism}, async () => {
+      while (cursor < partQueue.length) {
+        if (currentAbort) throw new Error('上传已取消');
+        const current = partQueue[cursor];
+        cursor += 1;
+        await uploadOnePart(current);
+      }
+    });
+
+    await Promise.all(workers);
+    const complete = await jsonFetch(`/api/uploads/${currentUploadId}/complete`, {method: 'POST'});
+    percentEl.textContent = '100%';
+    speedEl.textContent = '完成';
+    etaEl.textContent = 'ETA 0秒';
+    barEl.style.width = '100%';
+    detailEl.textContent = '所有分片已上传并完成合并';
+    return complete;
+  };
+
+  fileInput.addEventListener('change', async () => {
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) return;
+    hideSuccess();
+    showStatus();
+    percentEl.textContent = '0%';
+    speedEl.textContent = '0 KB/s';
+    etaEl.textContent = 'ETA --';
+    strategyEl.textContent = file.size <= MULTIPART_THRESHOLD ? '策略：单请求直传' : '策略：OCI multipart 分片并发上传';
+    detailEl.textContent = `已选择：${file.name}（${fmtBytes(file.size)}）`;
+    filePickerHint.textContent = `${file.name} · ${fmtBytes(file.size)}`;
+    barEl.style.width = '0%';
+  });
+
+  cancelBtn.addEventListener('click', async () => {
+    currentAbort = true;
+    for (const controller of Array.from(activeControllers)) {
+      try {
+        controller.abort();
+      } catch (_) {}
+    }
+    activeControllers.clear();
+    if (currentUploadId) {
+      try {
+        await fetch(`/api/uploads/${currentUploadId}`, {method: 'DELETE', credentials: 'same-origin'});
+      } catch (_) {}
+    }
+    detailEl.textContent = '上传已取消';
+    etaEl.textContent = 'ETA --';
+    strategyEl.textContent = '策略：已取消';
+    setIdle();
+  });
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const file = fileInput.files && fileInput.files[0];
+    if (!file) {
+      showStatus();
+      detailEl.textContent = '请先选择文件';
+      etaEl.textContent = 'ETA --';
+      return;
+    }
+
+    hideSuccess();
+    showStatus();
+    setBusy();
+    currentAbort = false;
+    currentUploadId = null;
+    detailEl.textContent = '正在准备上传...';
+    barEl.style.width = '0%';
+
+    try {
+      const result = file.size <= MULTIPART_THRESHOLD ? await uploadSingle(file) : await uploadMultipart(file);
+      const message = result.message || `上传成功：${result.object_name || file.name}`;
+      showSuccess(`✅ ${message}`);
+      detailEl.textContent = '上传完成，正在刷新列表...';
+      setIdle();
+      setTimeout(() => window.location.reload(), 900);
+    } catch (error) {
+      detailEl.textContent = `上传失败：${error.message || error}`;
+      etaEl.textContent = 'ETA --';
+      strategyEl.textContent = currentAbort ? '策略：已取消' : strategyEl.textContent;
+      setIdle();
+    }
+  });
+})();
+</script>
 {% endblock %}
