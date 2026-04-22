@@ -186,6 +186,12 @@ class OCIStorageService:
         except ServiceError as exc:
             raise OCIStorageError(f"取消分段上传失败: {exc.message}") from exc
 
+    def delete_object(self, object_name: str) -> None:
+        try:
+            self.client.delete_object(self.namespace, self.bucket_name, object_name)
+        except ServiceError as exc:
+            raise OCIStorageError(f"删除失败: {exc.message}") from exc
+
     def get_object(self, object_name: str):
         try:
             return self.client.get_object(self.namespace, self.bucket_name, object_name)
