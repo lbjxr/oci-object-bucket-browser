@@ -27,6 +27,7 @@ def make_client(tmp_path: Path):
             self.aborts = []
             self.upload_part_calls = []
             self.fail_parts = {}
+            self.deleted_objects = []
 
         def upload_file(self, object_name, fileobj, content_type=None):
             self.single_uploads.append((object_name, fileobj.read(), content_type))
@@ -50,6 +51,9 @@ def make_client(tmp_path: Path):
 
         def abort_multipart_upload(self, *, object_name, multipart_upload_id):
             self.aborts.append((object_name, multipart_upload_id))
+
+        def delete_object(self, object_name):
+            self.deleted_objects.append(object_name)
 
         def list_objects(self, prefix=''):
             return []
@@ -264,3 +268,36 @@ def test_upload_part_failure_is_reported_without_mutating_uploaded_parts(tmp_pat
     status = client.get(f'/api/uploads/{upload_id}')
     assert status.status_code == 200
     assert status.json()['uploaded_parts'] == []
+
+
+def test_delete_object_requires_login(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    client.cookies.clear()
+    response = client.delete('/objects/sample.txt')
+    assert response.status_code == 401
+    assert response.json()['detail'] == '未登录'
+    assert fake_storage.deleted_objects == []
+
+
+def test_delete_object_success(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    response = client.delete('/objects/folder%2Fsample.txt')
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['ok'] is True
+    assert payload['object_name'] == 'folder/sample.txt'
+    assert payload['message'] == '已删除对象：folder/sample.txt'
+    assert payload['detail'] == '对象“folder/sample.txt”已从 bucket 中移除。'
+    assert fake_storage.deleted_objects == ['folder/sample.txt']
+
+
+def test_delete_object_failure_is_reported(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+
+    def boom(object_name):
+        raise RuntimeError('missing object')
+
+    fake_storage.delete_object = boom
+    response = client.delete('/objects/missing.txt')
+    assert response.status_code == 500
+    assert response.json()['detail'] == '删除对象失败：missing.txt。异常信息：missing object'

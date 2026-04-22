@@ -411,6 +411,33 @@ def download(request: Request, object_name: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.delete("/objects/{object_name:path}")
+def delete_object(request: Request, object_name: str):
+    if not request.session.get("authenticated"):
+        return JSONResponse({"detail": "未登录"}, status_code=401)
+
+    try:
+        get_storage().delete_object(object_name)
+    except OCIStorageError as exc:
+        detail = str(exc)
+        raise HTTPException(
+            status_code=404,
+            detail=f"删除对象失败：{object_name}。{detail}",
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"删除对象失败：{object_name}。异常信息：{exc}",
+        ) from exc
+
+    return {
+        "ok": True,
+        "object_name": object_name,
+        "message": f"已删除对象：{object_name}",
+        "detail": f"对象“{object_name}”已从 bucket 中移除。",
+    }
+
+
 @router.get("/thumb/{object_name:path}")
 def thumb(request: Request, object_name: str):
     if not request.session.get("authenticated"):

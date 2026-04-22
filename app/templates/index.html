@@ -71,9 +71,9 @@
     <span class="pill">共 {{ objects|length }} 项</span>
   </div>
 
-  <div class="object-list single-list">
+  <div id="object-list" class="object-list single-list">
     {% for obj in objects %}
-    <article class="object-card object-card-unified object-row-card">
+    <article class="object-card object-card-unified object-row-card" data-object-row data-object-name="{{ obj.name }}">
       <div class="object-row-shell">
         <div class="object-row-main">
           <div class="object-main">
@@ -97,6 +97,7 @@
       <div class="object-toolbar">
         <a class="toolbar-link" href="/view/{{ obj.name }}">预览</a>
         <a class="toolbar-link" href="/download/{{ obj.name }}">下载</a>
+        <button class="toolbar-link toolbar-link-danger js-delete-object" type="button" data-object-name="{{ obj.name }}">删除</button>
       </div>
     </article>
     {% else %}
@@ -105,8 +106,14 @@
   </div>
 </section>
 
+<div id="object-delete-feedback" class="alert hidden" aria-live="polite"></div>
+
 <script>
 (() => {
+  const deleteButtons = Array.from(document.querySelectorAll('.js-delete-object'));
+  const objectList = document.getElementById('object-list');
+  const objectCountPill = document.querySelector('.pill');
+  const deleteFeedbackBox = document.getElementById('object-delete-feedback');
   const form = document.getElementById('upload-form');
   if (!form) return;
   const fileInput = document.getElementById('file');
@@ -162,6 +169,27 @@
     successBox.classList.remove('hidden');
   };
   const hideSuccess = () => successBox.classList.add('hidden');
+
+  const showDeleteFeedback = (message, type = 'success') => {
+    deleteFeedbackBox.textContent = message;
+    deleteFeedbackBox.className = `alert ${type === 'error' ? 'alert-error' : 'alert-success'}`;
+    deleteFeedbackBox.classList.remove('hidden');
+  };
+
+  const hideDeleteFeedback = () => deleteFeedbackBox.classList.add('hidden');
+
+  const updateObjectCount = () => {
+    if (!objectCountPill || !objectList) return;
+    const count = objectList.querySelectorAll('[data-object-row]').length;
+    objectCountPill.textContent = `共 ${count} 项`;
+  };
+
+  const ensureEmptyState = () => {
+    if (!objectList) return;
+    const remainingRows = objectList.querySelectorAll('[data-object-row]');
+    if (remainingRows.length > 0) return;
+    objectList.innerHTML = '<div class="empty-state">这里还没有对象，或者当前前缀下没有结果。</div>';
+  };
 
   const resetSpeedSamples = () => {
     speedSamples = [];
@@ -441,6 +469,7 @@
     const file = fileInput.files && fileInput.files[0];
     if (!file) return;
     hideSuccess();
+    hideDeleteFeedback();
     showStatus();
     percentEl.textContent = '0%';
     speedEl.textContent = '0 KB/s';
@@ -470,6 +499,41 @@
     setIdle();
   });
 
+  deleteButtons.forEach((button) => {
+    button.addEventListener('click', async () => {
+      const objectName = button.dataset.objectName || '';
+      if (!objectName) return;
+      const objectRow = button.closest('[data-object-row]');
+      const ok = window.confirm(`确认删除对象「${objectName}」吗？删除后不可恢复。`);
+      if (!ok) return;
+      hideSuccess();
+      hideDeleteFeedback();
+      button.disabled = true;
+      const originText = button.textContent;
+      button.textContent = '删除中...';
+      if (objectRow) objectRow.classList.add('object-card-pending-delete');
+      try {
+        const result = await jsonFetch(`/objects/${encodeURIComponent(objectName).replace(/%2F/g, '/')}`, {method: 'DELETE'});
+        if (objectRow) {
+          objectRow.classList.add('object-card-deleting');
+          window.setTimeout(() => {
+            objectRow.remove();
+            updateObjectCount();
+            ensureEmptyState();
+          }, 220);
+        }
+        const detailMessage = result.detail || `对象“${objectName}”已从当前列表移除。`;
+        showDeleteFeedback(`✅ 删除成功：${detailMessage}`, 'success');
+      } catch (error) {
+        if (objectRow) objectRow.classList.remove('object-card-pending-delete');
+        showDeleteFeedback(`删除失败：${error.message || error}`, 'error');
+      } finally {
+        button.disabled = false;
+        button.textContent = originText;
+      }
+    });
+  });
+
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     const file = fileInput.files && fileInput.files[0];
@@ -481,6 +545,7 @@
     }
 
     hideSuccess();
+    hideDeleteFeedback();
     showStatus();
     setBusy();
     currentAbort = false;

@@ -368,6 +368,18 @@ p {
   box-shadow: 0 8px 22px rgba(30, 119, 189, 0.08);
   backdrop-filter: blur(10px);
   margin-bottom: 0;
+  transition: opacity 0.22s ease, transform 0.22s ease, filter 0.22s ease;
+}
+
+.object-card-pending-delete {
+  opacity: 0.68;
+  filter: saturate(0.82);
+}
+
+.object-card-deleting {
+  opacity: 0;
+  transform: translateY(-6px) scale(0.985);
+  pointer-events: none;
 }
 
 .object-row-card {
@@ -481,11 +493,21 @@ p {
   color: var(--primary-strong);
   font-weight: 700;
   font-size: 0.88rem;
+  cursor: pointer;
 }
 
 .toolbar-link:hover {
   text-decoration: none;
   background: rgba(214, 239, 255, 1);
+}
+
+.toolbar-link-danger {
+  color: var(--danger);
+}
+
+.toolbar-link:disabled {
+  cursor: wait;
+  opacity: 0.72;
 }
 
 .object-meta-grid {
