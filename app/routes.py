@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import tempfile
+import zipfile
 from datetime import datetime
 from io import BytesIO
 from urllib.parse import quote
@@ -226,6 +228,31 @@ class UploadInitRequest(BaseModel):
 
 class BatchDeleteRequest(BaseModel):
     object_names: list[str]
+
+
+class BatchDownloadRequest(BaseModel):
+    object_names: list[str]
+
+
+def _normalize_object_names(object_names: list[str]) -> list[str]:
+    normalized = []
+    seen = set()
+    for raw_name in object_names:
+        name = (raw_name or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        normalized.append(name)
+    return normalized
+
+
+def _build_batch_download_filename(prefix: str, object_count: int) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    prefix_label = (prefix or "").strip().strip("/")
+    if prefix_label:
+        prefix_label = prefix_label.replace("/", "-").replace(" ", "-")[:48]
+        return f"oci-batch-{prefix_label}-{object_count}items-{timestamp}.zip"
+    return f"oci-batch-{object_count}items-{timestamp}.zip"
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -566,19 +593,48 @@ def download(request: Request, object_name: str):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+@router.post("/objects/batch-download")
+def batch_download_objects(request: Request, payload: BatchDownloadRequest = Body(...), prefix: str = ""):
+    if not request.session.get("authenticated"):
+        return JSONResponse({"detail": "未登录"}, status_code=401)
+
+    object_names = _normalize_object_names(payload.object_names)
+    if not object_names:
+        raise HTTPException(status_code=400, detail="至少要选择一个对象")
+
+    storage = get_storage()
+    temp_file = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    try:
+        with zipfile.ZipFile(temp_file, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+            for object_name in object_names:
+                try:
+                    stream, _content_type = storage.open_stream(object_name)
+                except OCIStorageError as exc:
+                    raise HTTPException(status_code=404, detail=f"批量下载打包失败：无法读取对象 {object_name}。{exc}") from exc
+                except Exception as exc:
+                    raise HTTPException(status_code=500, detail=f"批量下载打包失败：无法读取对象 {object_name}。异常信息：{exc}") from exc
+
+                with stream:
+                    archive.writestr(object_name, stream.read())
+
+        temp_file.seek(0)
+        filename = _build_batch_download_filename(prefix=prefix, object_count=len(object_names))
+        headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+        return StreamingResponse(temp_file, media_type="application/zip", headers=headers)
+    except HTTPException:
+        temp_file.close()
+        raise
+    except Exception as exc:
+        temp_file.close()
+        raise HTTPException(status_code=500, detail=f"批量下载打包失败：{exc}") from exc
+
+
 @router.post("/objects/batch-delete")
 def batch_delete_objects(request: Request, payload: BatchDeleteRequest = Body(...)):
     if not request.session.get("authenticated"):
         return JSONResponse({"detail": "未登录"}, status_code=401)
 
-    object_names = []
-    seen = set()
-    for raw_name in payload.object_names:
-        name = (raw_name or "").strip()
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        object_names.append(name)
+    object_names = _normalize_object_names(payload.object_names)
 
     if not object_names:
         raise HTTPException(status_code=400, detail="至少要选择一个对象")

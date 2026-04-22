@@ -74,6 +74,7 @@
         <span id="batch-delete-selection" class="batch-delete-selection">已选 0 项</span>
         <button id="batch-delete-select-all" class="toolbar-link" type="button">全选当前结果</button>
         <button id="batch-delete-clear" class="toolbar-link" type="button" disabled>清空选择</button>
+        <button id="batch-download-button" class="toolbar-link" type="button" disabled>下载所选</button>
         <button id="batch-delete-button" class="toolbar-link toolbar-link-danger" type="button" disabled>批量删除</button>
       </div>
       {% endif %}
@@ -152,6 +153,7 @@
   const batchDeleteToolbar = document.getElementById('batch-delete-toolbar');
   const batchDeleteSelection = document.getElementById('batch-delete-selection');
   const batchDeleteButton = document.getElementById('batch-delete-button');
+  const batchDownloadButton = document.getElementById('batch-download-button');
   const batchDeleteSelectAll = document.getElementById('batch-delete-select-all');
   const batchDeleteClear = document.getElementById('batch-delete-clear');
   const form = document.getElementById('upload-form');
@@ -309,6 +311,7 @@
     const count = selected.length;
     batchDeleteSelection.textContent = `已选 ${count} 项`;
     batchDeleteButton.disabled = count === 0;
+    if (batchDownloadButton) batchDownloadButton.disabled = count === 0;
     if (batchDeleteClear) batchDeleteClear.disabled = count === 0;
     if (batchDeleteSelectAll) batchDeleteSelectAll.disabled = enabledCount === 0 || count === enabledCount;
     batchDeleteToolbar.classList.toggle('hidden', boxes.length === 0);
@@ -753,6 +756,57 @@
     syncBatchDeleteToolbar();
   };
 
+  const triggerBatchDownload = async () => {
+    const selected = getSelectedObjectNames();
+    if (selected.length === 0) return;
+
+    hideSuccess();
+    hideDeleteFeedback();
+    const originText = batchDownloadButton.textContent;
+    batchDownloadButton.disabled = true;
+    batchDeleteButton.disabled = true;
+    if (batchDeleteClear) batchDeleteClear.disabled = true;
+    batchDownloadButton.textContent = '打包中...';
+
+    try {
+      const currentPrefix = objectList?.dataset.currentPrefix || '';
+      const response = await fetch(`/objects/batch-download?prefix=${encodeURIComponent(currentPrefix)}`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({object_names: selected}),
+      });
+
+      if (!response.ok) {
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const payload = await response.json();
+          throw new Error(payload.detail || payload.message || `HTTP ${response.status}`);
+        }
+        throw new Error(await response.text() || `HTTP ${response.status}`);
+      }
+
+      const blob = await response.blob();
+      const disposition = response.headers.get('content-disposition') || '';
+      const filenameMatch = disposition.match(/filename="([^"]+)"/i);
+      const filename = filenameMatch ? filenameMatch[1] : `oci-batch-${selected.length}.zip`;
+      const objectUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => window.URL.revokeObjectURL(objectUrl), 1000);
+      showDeleteFeedback(`✅ 已开始下载打包文件：${filename}`, 'success');
+    } catch (error) {
+      showDeleteFeedback(`批量下载失败：${error.message || error}`, 'error');
+    } finally {
+      batchDownloadButton.textContent = originText;
+      syncBatchDeleteToolbar();
+    }
+  };
+
   const handleBatchDelete = async () => {
     const selected = getSelectedObjectNames();
     if (selected.length === 0) return;
@@ -762,6 +816,7 @@
     hideSuccess();
     hideDeleteFeedback();
     batchDeleteButton.disabled = true;
+    if (batchDownloadButton) batchDownloadButton.disabled = true;
     batchDeleteClear.disabled = true;
     const originBatchText = batchDeleteButton.textContent;
     batchDeleteButton.textContent = '删除中...';
@@ -869,6 +924,10 @@
       hideDeleteFeedback();
       syncBatchDeleteToolbar();
     });
+  }
+
+  if (batchDownloadButton) {
+    batchDownloadButton.addEventListener('click', triggerBatchDownload);
   }
 
   if (batchDeleteButton) {

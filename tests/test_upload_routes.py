@@ -77,7 +77,11 @@ def make_client(tmp_path: Path):
             return []
 
         def open_stream(self, object_name):
-            raise AssertionError('not used in this test')
+            payload = getattr(self, 'download_payloads', {}).get(object_name)
+            if payload is None:
+                raise AssertionError(f'unexpected open_stream for {object_name}')
+            from io import BytesIO
+            return BytesIO(payload), 'application/octet-stream'
 
         def get_preview(self, object_name):
             raise AssertionError('not used in this test')
@@ -125,13 +129,51 @@ def test_init_upload_session_returns_parallelism_and_strategy(tmp_path):
 
 
 def test_index_includes_dynamic_throttle_concurrency_copy(tmp_path):
-    client, _ = make_client(tmp_path)
+    client, fake_storage = make_client(tmp_path)
+
+    class _Object:
+        def __init__(self):
+            self.name = 'docs/a.txt'
+            self.size = 12
+            self.etag = 'etag-a'
+            self.time_created = '2026-04-22T10:00:00+00:00'
+            self.content_type = 'text/plain'
+
+    fake_storage.list_objects = lambda prefix='': [_Object()]
+
     response = client.get('/')
     assert response.status_code == 200
     html = response.text
     assert 'THROTTLE_STREAK_REDUCE_THRESHOLD = 2' in html
     assert '限流收敛至 ${targetConcurrency}/${parallelism} 路' in html
     assert '已临时下调上传并发到 ${targetConcurrency}/${parallelism} 路' in html
+    assert '下载所选' in html
+    assert '/objects/batch-download' in html
+
+
+
+def test_batch_download_returns_zip_of_selected_objects(tmp_path):
+    import io
+    import zipfile
+
+    client, fake_storage = make_client(tmp_path)
+    fake_storage.download_payloads = {
+        'docs/a.txt': b'hello-a',
+        'images/b.png': b'hello-b',
+    }
+
+    response = client.post(
+        '/objects/batch-download?prefix=docs/',
+        json={'object_names': ['docs/a.txt', 'images/b.png', 'docs/a.txt']},
+    )
+    assert response.status_code == 200
+    assert response.headers['content-type'].startswith('application/zip')
+    assert 'attachment; filename="oci-batch-docs-2items-' in response.headers['content-disposition']
+
+    archive = zipfile.ZipFile(io.BytesIO(response.content))
+    assert sorted(archive.namelist()) == ['docs/a.txt', 'images/b.png']
+    assert archive.read('docs/a.txt') == b'hello-a'
+    assert archive.read('images/b.png') == b'hello-b'
 
 
 
@@ -222,6 +264,14 @@ def test_upload_part_returns_existing_etag_when_part_already_uploaded(tmp_path):
     assert second.status_code == 200
     assert second.json()['already_uploaded'] is True
     assert fake_storage.upload_part_calls == [('mp-1', 1, 8 * 1024 * 1024)]
+
+
+
+def test_batch_download_requires_selection(tmp_path):
+    client, _ = make_client(tmp_path)
+    response = client.post('/objects/batch-download', json={'object_names': []})
+    assert response.status_code == 400
+    assert response.json()['detail'] == '至少要选择一个对象'
 
 
 
