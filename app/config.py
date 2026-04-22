@@ -20,6 +20,10 @@ class Settings:
     auth_password: str = "change-me"
     session_secret: str = "change-this-session-secret"
     session_cookie_name: str = "oci_bucket_browser_session"
+    upload_chunk_size_mb: int = 16
+    upload_single_put_threshold_mb: int = 32
+    upload_parallelism: int = 6
+    upload_session_dir: str = "./tmp/upload_sessions"
 
 
 @lru_cache(maxsize=1)
@@ -40,4 +44,8 @@ def get_settings() -> Settings:
         auth_password=os.getenv("APP_AUTH_PASSWORD", "change-me"),
         session_secret=os.getenv("APP_SESSION_SECRET", "change-this-session-secret"),
         session_cookie_name=os.getenv("APP_SESSION_COOKIE_NAME", "oci_bucket_browser_session").strip() or "oci_bucket_browser_session",
+        upload_chunk_size_mb=max(8, int(os.getenv("APP_UPLOAD_CHUNK_SIZE_MB", "16"))),
+        upload_single_put_threshold_mb=max(1, int(os.getenv("APP_UPLOAD_SINGLE_PUT_THRESHOLD_MB", "32"))),
+        upload_parallelism=max(1, int(os.getenv("APP_UPLOAD_PARALLELISM", "6"))),
+        upload_session_dir=os.getenv("APP_UPLOAD_SESSION_DIR", "./tmp/upload_sessions").strip() or "./tmp/upload_sessions",
     )
