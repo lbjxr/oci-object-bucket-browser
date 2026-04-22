@@ -162,8 +162,9 @@
   const MULTIPART_THRESHOLD = {{ upload_single_put_threshold_mb|int }} * 1024 * 1024;
   const FALLBACK_CHUNK_SIZE = {{ upload_chunk_size_mb|int }} * 1024 * 1024;
   const FALLBACK_PARALLELISM = {{ upload_parallelism|int }};
-  const MAX_PART_RETRIES = 3;
+  const MAX_PART_RETRIES = 4;
   const PART_RETRY_BASE_DELAY_MS = 800;
+  const PART_RETRY_MAX_DELAY_MS = 5000;
 
   const activeControllers = new Set();
   let currentUploadId = null;
@@ -410,6 +411,45 @@
 
   const sleep = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
 
+  const normalizePartUploadError = (partNum, error) => {
+    const payload = error && typeof error === 'object' && 'payload' in error ? error.payload : null;
+    const errorCode = payload && payload.error_code ? payload.error_code : 'unknown';
+    const retryable = typeof (payload && payload.retryable) === 'boolean'
+      ? payload.retryable
+      : ['timeout', 'connection', 'http_5xx'].includes(errorCode);
+    const reason = payload && payload.reason
+      ? payload.reason
+      : (error && error.message ? error.message : `分片 ${partNum} 上传失败`);
+    return {
+      errorCode,
+      retryable,
+      reason,
+      message: payload && payload.detail ? payload.detail : reason,
+    };
+  };
+
+  const retryDelayFor = (errorCode, attempt) => {
+    const jitter = Math.floor(Math.random() * 250);
+    if (errorCode === 'timeout') {
+      return Math.min(PART_RETRY_MAX_DELAY_MS, 1200 * attempt + jitter);
+    }
+    if (errorCode === 'connection') {
+      return Math.min(PART_RETRY_MAX_DELAY_MS, 900 * attempt + jitter);
+    }
+    if (errorCode === 'http_5xx') {
+      return Math.min(PART_RETRY_MAX_DELAY_MS, PART_RETRY_BASE_DELAY_MS * (2 ** (attempt - 1)) + jitter);
+    }
+    return Math.min(PART_RETRY_MAX_DELAY_MS, PART_RETRY_BASE_DELAY_MS * attempt + jitter);
+  };
+
+  const retryLabelFor = (errorCode) => {
+    if (errorCode === 'timeout') return '请求超时';
+    if (errorCode === 'connection') return '连接中断';
+    if (errorCode === 'http_5xx') return '服务端 5xx';
+    if (errorCode === 'http_4xx') return '请求被拒绝/4xx';
+    return '未知错误';
+  };
+
   const uploadMultipart = async (file) => {
     const fingerprint = await buildFingerprint(file);
     const init = await jsonFetch('/api/uploads/init', {
@@ -528,11 +568,21 @@
           return await uploadOnePartOnce(partNum);
         } catch (error) {
           if (currentAbort) throw error;
-          if (attempt >= MAX_PART_RETRIES) {
-            throw new Error(`分片 ${partNum} 上传失败，已重试 ${attempt} 次：${error.message || error}`);
+          const info = normalizePartUploadError(partNum, error);
+          const errorLabel = retryLabelFor(info.errorCode);
+          if (!info.retryable) {
+            detailEl.textContent = `分片 ${partNum} 失败：${errorLabel}；已停止重试`;
+            throw new Error(`分片 ${partNum} 上传失败：${info.reason}（${errorLabel}，不可重试，已停止）`);
           }
-          detailEl.textContent = `分片 ${partNum} 第 ${attempt} 次失败，准备重试...`;
-          await sleep(PART_RETRY_BASE_DELAY_MS * attempt);
+          if (attempt >= MAX_PART_RETRIES) {
+            detailEl.textContent = `分片 ${partNum} 失败：${errorLabel}；已达到重试上限`;
+            throw new Error(`分片 ${partNum} 上传失败：${info.reason}（${errorLabel}，已重试 ${attempt} 次后停止）`);
+          }
+          const nextAttempt = attempt + 1;
+          const delayMs = retryDelayFor(info.errorCode, attempt);
+          detailEl.textContent = `分片 ${partNum} 失败：${errorLabel}；${Math.ceil(delayMs / 1000)} 秒后重试第 ${nextAttempt}/${MAX_PART_RETRIES} 次`;
+          etaEl.textContent = `ETA 重试等待 ${fmtDuration(delayMs / 1000)}`;
+          await sleep(delayMs);
         }
       }
       throw new Error(`分片 ${partNum} 上传失败`);

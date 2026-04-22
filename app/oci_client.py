@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 from typing import BinaryIO
+import socket
 
 import oci
 from oci.config import validate_config
@@ -19,7 +20,58 @@ from app.utils import guess_content_type, is_image_type, is_pdf_type, is_text_ty
 
 
 class OCIStorageError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        category: str = "unknown",
+        retryable: bool = False,
+        status_code: int = 500,
+        reason: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.category = category
+        self.retryable = retryable
+        self.status_code = status_code
+        self.reason = reason or message
+
+
+def classify_upload_exception(exc: Exception) -> tuple[str, bool, int, str]:
+    if isinstance(exc, ServiceError):
+        status = int(getattr(exc, "status", 500) or 500)
+        code = (getattr(exc, "code", "") or "").strip()
+        message = (getattr(exc, "message", "") or str(exc)).strip() or "OCI 服务返回异常"
+        if 500 <= status <= 599:
+            return "http_5xx", True, 503, f"OCI 服务暂时不可用（HTTP {status}{f', {code}' if code else ''}）: {message}"
+        if status == 408:
+            return "timeout", True, 504, f"OCI 服务处理超时（HTTP 408）: {message}"
+        if status == 429:
+            return "http_4xx", True, 429, f"OCI 服务限流（HTTP 429）: {message}"
+        if 400 <= status <= 499:
+            return "http_4xx", False, status, f"OCI 服务拒绝该分片请求（HTTP {status}{f', {code}' if code else ''}）: {message}"
+        return "unknown", False, 500, message
+
+    if isinstance(exc, TimeoutError) or isinstance(exc, socket.timeout):
+        return "timeout", True, 504, "上传分片到 OCI 超时"
+
+    lowered = str(exc).lower()
+    connection_keywords = (
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "broken pipe",
+        "temporarily unavailable",
+        "remote end closed",
+        "timed out",
+        "timeout",
+        "econnreset",
+        "econnaborted",
+        "econnrefused",
+    )
+    if any(keyword in lowered for keyword in connection_keywords):
+        return "connection", True, 503, f"上传分片到 OCI 时连接中断: {exc}"
+
+    return "unknown", False, 500, f"上传分片失败: {exc}"
 
 
 class OCIStorageService:
@@ -123,12 +175,20 @@ class OCIStorageService:
             )
             etag = response.headers.get("etag") or getattr(response.data, "etag", None)
             if not etag:
-                raise OCIStorageError("分片上传成功但未返回 ETag")
+                raise OCIStorageError("分片上传成功但未返回 ETag", category="unknown", retryable=False, status_code=500)
             return etag
-        except ServiceError as exc:
-            raise OCIStorageError(f"上传分片失败（part {part_num}）: {exc.message}") from exc
+        except OCIStorageError:
+            raise
         except Exception as exc:
-            raise OCIStorageError(f"上传分片失败（part {part_num}）: {exc}") from exc
+            category, retryable, status_code, reason = classify_upload_exception(exc)
+            retry_hint = "可重试" if retryable else "不可重试"
+            raise OCIStorageError(
+                f"上传分片失败（part {part_num}，{retry_hint}，{category}）: {reason}",
+                category=category,
+                retryable=retryable,
+                status_code=status_code,
+                reason=reason,
+            ) from exc
 
     def list_multipart_uploaded_parts(self, *, object_name: str, multipart_upload_id: str) -> dict[int, str]:
         page = None
@@ -218,4 +278,4 @@ class OCIStorageService:
         return BytesIO(response.data.content), content_type
 
 
-__all__ = ["OCIStorageService", "OCIStorageError"]
+__all__ = ["OCIStorageService", "OCIStorageError", "classify_upload_exception"]

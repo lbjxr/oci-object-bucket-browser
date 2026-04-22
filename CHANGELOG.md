@@ -21,9 +21,12 @@ All notable changes to this project will be documented in this file.
 - Default multipart parallelism changed from `4` to `6`.
 - Multipart browser upload implementation changed from `fetch` to `XMLHttpRequest` to expose real-time upload progress.
 - Upload speed display changed to a recent `3-second` sliding-window average for more realistic UX.
+- Multipart part retry policy now distinguishes timeout / connection interruption / HTTP 5xx / HTTP 4xx-like failures instead of applying the same basic retry behavior to every error.
+- Multipart upload status text now shows clearer failure reasons, whether the browser will retry, and when retrying has already stopped.
+- Upload-part API responses now include structured retry hints (`error_code`, `retryable`, `reason`) to help the frontend decide how to present and handle failures.
 - Delete UX now supports multi-select batch delete, current-result select-all / clear, visible selected-count feedback, keeps the current filtered list context, removes successfully deleted rows inline first, and avoids an immediate hard page reload.
 - Delete success / failure messages now include clearer object-specific details, including partial-failure feedback for batch delete.
-- README updated with deployment guidance, proxy/Cloudflare advice, resumable upload notes, benchmark notes, delete support, and current recommended defaults.
+- README updated with deployment guidance, proxy/Cloudflare advice, resumable upload notes, benchmark notes, delete support, current recommended defaults, and the first-round upload reliability notes.
 
 ### Fixed
 - Fixed multipart upload progress feeling “stuck” for large chunks.
@@ -40,5 +43,5 @@ All notable changes to this project will be documented in this file.
 
 ### Known limitations
 - Resume support is lightweight and primarily aimed at same-browser reselection / refresh recovery.
-- Retry strategy is currently basic and does not yet branch by error class.
+- Retry policy is smarter than before, but still remains a frontend-led first version rather than a fully adaptive upload scheduler.
 - OCI-side multipart part reconciliation after service restart is not yet implemented.

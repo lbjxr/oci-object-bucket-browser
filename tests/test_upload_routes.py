@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from fastapi.testclient import TestClient
+from oci.exceptions import ServiceError
 
 
 def make_client(tmp_path: Path):
@@ -27,6 +28,7 @@ def make_client(tmp_path: Path):
             self.aborts = []
             self.upload_part_calls = []
             self.fail_parts = {}
+            self.fail_part_errors = {}
             self.deleted_objects = []
 
         def upload_file(self, object_name, fileobj, content_type=None):
@@ -39,6 +41,9 @@ def make_client(tmp_path: Path):
 
         def upload_part(self, *, object_name, multipart_upload_id, part_num, payload, content_type=None):
             self.upload_part_calls.append((multipart_upload_id, part_num, len(payload)))
+            error_factory = self.fail_part_errors.get(part_num)
+            if callable(error_factory):
+                raise error_factory()
             remaining_failures = self.fail_parts.get(part_num, 0)
             if remaining_failures > 0:
                 self.fail_parts[part_num] = remaining_failures - 1
@@ -265,11 +270,110 @@ def test_upload_part_failure_is_reported_without_mutating_uploaded_parts(tmp_pat
         headers={'Content-Type': 'application/octet-stream'},
     )
     assert response.status_code == 500
-    assert 'boom-part-2' in response.json()['detail']
+    payload = response.json()
+    assert 'boom-part-2' in payload['detail']
+    assert payload['retryable'] is False
+    assert payload['error_code'] == 'unknown'
 
     status = client.get(f'/api/uploads/{upload_id}')
     assert status.status_code == 200
     assert status.json()['uploaded_parts'] == []
+
+
+def test_upload_part_timeout_is_marked_retryable(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    init = client.post(
+        '/api/uploads/init',
+        json={
+            'filename': 'big.bin',
+            'file_size': 20 * 1024 * 1024,
+            'content_type': 'application/octet-stream',
+            'file_fingerprint': 'timeout-part',
+        },
+    )
+    upload_id = init.json()['upload_id']
+    fake_storage.fail_part_errors[1] = lambda: TimeoutError('socket timed out')
+
+    response = client.put(
+        f'/api/uploads/{upload_id}/part/1',
+        content=b'a' * (8 * 1024 * 1024),
+        headers={'Content-Type': 'application/octet-stream'},
+    )
+    assert response.status_code == 504
+    payload = response.json()
+    assert payload['retryable'] is True
+    assert payload['error_code'] == 'timeout'
+    assert '超时' in payload['reason']
+
+
+def test_upload_part_http_5xx_is_marked_retryable(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    init = client.post(
+        '/api/uploads/init',
+        json={
+            'filename': 'big.bin',
+            'file_size': 20 * 1024 * 1024,
+            'content_type': 'application/octet-stream',
+            'file_fingerprint': 'http-5xx-part',
+        },
+    )
+    upload_id = init.json()['upload_id']
+    fake_storage.fail_part_errors[2] = lambda: ServiceError(
+        status=502,
+        code='BadGateway',
+        headers={},
+        message='upstream unstable',
+        request_endpoint='/uploadPart',
+        client_version='test',
+        timestamp='now',
+        opc_request_id='req-1',
+    )
+
+    response = client.put(
+        f'/api/uploads/{upload_id}/part/2',
+        content=b'b' * (8 * 1024 * 1024),
+        headers={'Content-Type': 'application/octet-stream'},
+    )
+    assert response.status_code == 503
+    payload = response.json()
+    assert payload['retryable'] is True
+    assert payload['error_code'] == 'http_5xx'
+    assert 'HTTP 502' in payload['reason']
+
+
+def test_upload_part_http_4xx_stops_retry_early(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    init = client.post(
+        '/api/uploads/init',
+        json={
+            'filename': 'big.bin',
+            'file_size': 20 * 1024 * 1024,
+            'content_type': 'application/octet-stream',
+            'file_fingerprint': 'http-4xx-part',
+        },
+    )
+    upload_id = init.json()['upload_id']
+    fake_storage.fail_part_errors[3] = lambda: ServiceError(
+        status=400,
+        code='InvalidParameter',
+        headers={},
+        message='bad request',
+        request_endpoint='/uploadPart',
+        client_version='test',
+        timestamp='now',
+        opc_request_id='req-2',
+    )
+
+    response = client.put(
+        f'/api/uploads/{upload_id}/part/3',
+        content=b'c' * (4 * 1024 * 1024),
+        headers={'Content-Type': 'application/octet-stream'},
+    )
+    assert response.status_code == 400
+    payload = response.json()
+    assert payload['retryable'] is False
+    assert payload['error_code'] == 'http_4xx'
+    assert 'HTTP 400' in payload['reason']
 
 
 def test_delete_object_requires_login(tmp_path):

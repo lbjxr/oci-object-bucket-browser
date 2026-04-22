@@ -6,19 +6,30 @@ from datetime import datetime
 from io import BytesIO
 from urllib.parse import quote
 
-from fastapi import APIRouter, Body, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Body, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from app.config import get_settings
-from app.oci_client import OCIStorageError, OCIStorageService
+from app.oci_client import OCIStorageError, OCIStorageService, classify_upload_exception
 from app.upload_sessions import UploadedPart, UploadSessionStore
 from app.utils import is_image_type, is_pdf_type, is_text_type, object_name_from_upload, to_data_url
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
+
+
+def build_upload_error_payload(*, part_num: int, exc: OCIStorageError) -> dict[str, object]:
+    return {
+        "ok": False,
+        "part_num": part_num,
+        "detail": str(exc),
+        "error_code": exc.category,
+        "retryable": exc.retryable,
+        "reason": exc.reason,
+    }
 
 
 def format_size_mb(size: int | None) -> str:
@@ -265,7 +276,7 @@ async def init_upload(request: Request, payload: UploadInitRequest = Body(...)):
 
 
 @router.put("/api/uploads/{upload_id}/part/{part_num}")
-async def upload_part(request: Request, upload_id: str, part_num: int, body: bytes = Body(...)):
+async def upload_part(request: Request, response: Response, upload_id: str, part_num: int, body: bytes = Body(...)):
     require_login(request)
     if part_num <= 0:
         raise HTTPException(status_code=400, detail="part_num 必须从 1 开始")
@@ -302,9 +313,19 @@ async def upload_part(request: Request, upload_id: str, part_num: int, body: byt
             content_type=session.content_type,
         )
     except OCIStorageError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        response.status_code = exc.status_code
+        return build_upload_error_payload(part_num=part_num, exc=exc)
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"上传分片失败（part {part_num}）: {exc}") from exc
+        category, retryable, status_code, reason = classify_upload_exception(exc)
+        wrapped = OCIStorageError(
+            f"上传分片失败（part {part_num}，{'可重试' if retryable else '不可重试'}，{category}）: {reason}",
+            category=category,
+            retryable=retryable,
+            status_code=status_code,
+            reason=reason,
+        )
+        response.status_code = wrapped.status_code
+        return build_upload_error_payload(part_num=part_num, exc=wrapped)
 
     try:
         store.update(
