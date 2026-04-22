@@ -121,6 +121,17 @@
 </section>
 
 <div id="object-delete-feedback" class="alert hidden" aria-live="polite"></div>
+<template id="batch-delete-feedback-template">
+  <div class="delete-feedback-summary"></div>
+  <div class="delete-feedback-meta hidden">
+    <span class="delete-feedback-pill js-delete-success-count"></span>
+    <span class="delete-feedback-pill js-delete-failed-count"></span>
+  </div>
+  <div class="delete-feedback-failed hidden">
+    <div class="delete-feedback-failed-title">失败对象</div>
+    <div class="delete-feedback-failed-list js-delete-failed-list"></div>
+  </div>
+</template>
 
 <script>
 (() => {
@@ -189,13 +200,56 @@
   };
   const hideSuccess = () => successBox.classList.add('hidden');
 
-  const showDeleteFeedback = (message, type = 'success') => {
-    deleteFeedbackBox.textContent = message;
+  const deleteFeedbackTemplate = document.getElementById('batch-delete-feedback-template');
+
+  const escapeHtml = (value) => String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+  const renderBatchDeleteFeedback = ({message, type = 'success', deletedCount = null, failedCount = null, failedNames = []}) => {
+    if (!deleteFeedbackBox) return;
+    if (!deleteFeedbackTemplate) {
+      deleteFeedbackBox.textContent = message;
+      deleteFeedbackBox.className = `alert ${type === 'error' ? 'alert-error' : 'alert-success'}`;
+      deleteFeedbackBox.classList.remove('hidden');
+      return;
+    }
+    const fragment = deleteFeedbackTemplate.content.cloneNode(true);
+    const summary = fragment.querySelector('.delete-feedback-summary');
+    const meta = fragment.querySelector('.delete-feedback-meta');
+    const successCountEl = fragment.querySelector('.js-delete-success-count');
+    const failedCountEl = fragment.querySelector('.js-delete-failed-count');
+    const failedWrap = fragment.querySelector('.delete-feedback-failed');
+    const failedList = fragment.querySelector('.js-delete-failed-list');
+
+    if (summary) summary.textContent = message;
+    if (meta && (deletedCount !== null || failedCount !== null)) {
+      meta.classList.remove('hidden');
+      if (successCountEl) successCountEl.textContent = `成功 ${deletedCount ?? 0} 项`;
+      if (failedCountEl) failedCountEl.textContent = `失败 ${failedCount ?? 0} 项`;
+    }
+    if (failedWrap && failedList && failedNames.length > 0) {
+      failedWrap.classList.remove('hidden');
+      failedList.innerHTML = failedNames.map((name) => `<code>${escapeHtml(name)}</code>`).join('');
+    }
+
+    deleteFeedbackBox.innerHTML = '';
+    deleteFeedbackBox.appendChild(fragment);
     deleteFeedbackBox.className = `alert ${type === 'error' ? 'alert-error' : 'alert-success'}`;
     deleteFeedbackBox.classList.remove('hidden');
   };
 
-  const hideDeleteFeedback = () => deleteFeedbackBox.classList.add('hidden');
+  const showDeleteFeedback = (message, type = 'success') => {
+    renderBatchDeleteFeedback({message, type});
+  };
+
+  const hideDeleteFeedback = () => {
+    deleteFeedbackBox.classList.add('hidden');
+    deleteFeedbackBox.innerHTML = '';
+  };
 
   const getObjectRow = (objectName) => objectList ? objectList.querySelector(`[data-object-row][data-object-name="${CSS.escape(objectName)}"]`) : null;
 
@@ -527,13 +581,13 @@
     });
   };
 
-  const setSelectedInputsDisabled = (objectNames, disabled = true) => {
+  const updateSelectedInputs = (objectNames, {disabled, checked} = {}) => {
     const boxes = getSelectBoxes();
     objectNames.forEach((objectName) => {
       const input = boxes.find((box) => box.value === objectName);
       if (!input) return;
-      input.disabled = disabled;
-      if (disabled) input.checked = false;
+      if (typeof disabled === 'boolean') input.disabled = disabled;
+      if (typeof checked === 'boolean') input.checked = checked;
     });
     syncBatchDeleteToolbar();
   };
@@ -551,32 +605,48 @@
     const originBatchText = batchDeleteButton.textContent;
     batchDeleteButton.textContent = '删除中...';
     setRowPending(selected, true);
-    setSelectedInputsDisabled(selected, true);
+    updateSelectedInputs(selected, {disabled: true, checked: true});
 
     try {
       const result = await jsonFetch('/objects/batch-delete', {
         method: 'POST',
         body: JSON.stringify({object_names: selected}),
       });
-      removeObjectRows(result.deleted || []);
-      showDeleteFeedback(`✅ ${result.message || `已删除 ${result.deleted_count || 0} 个对象`}`, 'success');
+      const deletedNames = Array.isArray(result.deleted) ? result.deleted : [];
+      removeObjectRows(deletedNames);
+      renderBatchDeleteFeedback({
+        message: `✅ ${result.message || `已删除 ${result.deleted_count || 0} 个对象`}`,
+        type: 'success',
+        deletedCount: result.deleted_count ?? deletedNames.length,
+        failedCount: result.failed_count ?? 0,
+        failedNames: [],
+      });
     } catch (error) {
       const message = error.message || String(error);
       let responsePayload = null;
       if (error && typeof error === 'object' && 'payload' in error) {
         responsePayload = error.payload;
       }
-      if (responsePayload && Array.isArray(responsePayload.deleted) && responsePayload.deleted.length > 0) {
-        removeObjectRows(responsePayload.deleted);
+      if (responsePayload) {
+        const deletedNames = Array.isArray(responsePayload.deleted) ? responsePayload.deleted : [];
         const failedNames = Array.isArray(responsePayload.failed)
           ? responsePayload.failed.map((item) => item.object_name).filter(Boolean)
           : [];
-        showDeleteFeedback(
-          `⚠️ ${responsePayload.message || '部分对象删除失败'}${failedNames.length ? `；失败：${failedNames.join('、')}` : ''}`,
-          'error'
-        );
+        if (deletedNames.length > 0) {
+          removeObjectRows(deletedNames);
+        }
+        setRowPending(failedNames, false);
+        updateSelectedInputs(failedNames, {disabled: false, checked: true});
+        renderBatchDeleteFeedback({
+          message: `${deletedNames.length > 0 ? '⚠️ ' : ''}${responsePayload.message || '部分对象删除失败'}`,
+          type: 'error',
+          deletedCount: responsePayload.deleted_count ?? deletedNames.length,
+          failedCount: responsePayload.failed_count ?? failedNames.length,
+          failedNames,
+        });
       } else {
         setRowPending(selected, false);
+        updateSelectedInputs(selected, {disabled: false, checked: true});
         showDeleteFeedback(`删除失败：${message}`, 'error');
       }
     } finally {

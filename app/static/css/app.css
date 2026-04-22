@@ -622,6 +622,52 @@ p {
   border-radius: 16px;
 }
 
+.delete-feedback-summary {
+  font-weight: 700;
+}
+
+.delete-feedback-meta {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+}
+
+.delete-feedback-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 0.86rem;
+  font-weight: 700;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(18, 50, 74, 0.08);
+}
+
+.delete-feedback-failed {
+  margin-top: 12px;
+}
+
+.delete-feedback-failed-title {
+  margin-bottom: 8px;
+  font-size: 0.9rem;
+  font-weight: 700;
+}
+
+.delete-feedback-failed-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.delete-feedback-failed-list code {
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .alert-error {
   background: rgba(214, 69, 69, 0.1);
   color: var(--danger);

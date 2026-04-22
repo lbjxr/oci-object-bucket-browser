@@ -363,6 +363,8 @@ def test_batch_delete_objects_partial_failure(tmp_path):
     assert payload['failed_count'] == 1
     assert payload['deleted'] == ['alpha.txt', 'gamma.txt']
     assert payload['failed'] == [{'object_name': 'folder/beta.txt', 'detail': '异常信息：locked'}]
+    assert payload['message'] == '批量删除部分完成：成功 2 个，失败 1 个。'
+    assert payload['detail'] == '失败对象：folder/beta.txt'
     assert fake_storage.deleted_objects == ['alpha.txt', 'gamma.txt']
 
 
