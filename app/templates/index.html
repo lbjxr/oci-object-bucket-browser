@@ -93,12 +93,22 @@
           <div class="object-main">
             <div class="object-name">{{ obj.name }}</div>
             <div class="object-subline">
-              <span>{{ obj.content_type or '未知类型' }}</span>
+              <span>{{ obj.file_type_label }}</span>
+              {% if obj.content_type %}
               <span class="dot-sep">•</span>
-              <span>{{ obj.time_display }}</span>
+              <span title="{{ obj.content_type }}">{{ obj.content_type }}</span>
+              {% endif %}
+              {% if obj.time_display %}
+              <span class="dot-sep">•</span>
+              <span>创建于 {{ obj.time_display }}</span>
+              {% endif %}
+              {% if obj.size_exact %}
+              <span class="dot-sep">•</span>
+              <span title="{{ obj.size_exact }}">{{ obj.size_exact }}</span>
+              {% endif %}
             </div>
           </div>
-          <span class="object-size-badge">{{ obj.size_mb }}</span>
+          <span class="object-size-badge" title="{{ obj.size_exact }}">{{ obj.size_mb }}</span>
         </div>
         <div class="object-thumb-wrap">
           {% if obj.is_image %}
@@ -128,8 +138,12 @@
     <span class="delete-feedback-pill js-delete-failed-count"></span>
   </div>
   <div class="delete-feedback-failed hidden">
-    <div class="delete-feedback-failed-title">失败对象</div>
+    <div class="delete-feedback-failed-head">
+      <div class="delete-feedback-failed-title">失败对象</div>
+      <button class="toolbar-link delete-feedback-toggle js-delete-failed-toggle hidden" type="button" aria-expanded="false">展开全部</button>
+    </div>
     <div class="delete-feedback-failed-list js-delete-failed-list"></div>
+    <div class="delete-feedback-failed-more js-delete-failed-more hidden"></div>
   </div>
 </template>
 
@@ -210,6 +224,8 @@
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 
+  const DELETE_FAILED_INLINE_LIMIT = 6;
+
   const renderBatchDeleteFeedback = ({message, type = 'success', deletedCount = null, failedCount = null, failedNames = []}) => {
     if (!deleteFeedbackBox) return;
     if (!deleteFeedbackTemplate) {
@@ -225,6 +241,8 @@
     const failedCountEl = fragment.querySelector('.js-delete-failed-count');
     const failedWrap = fragment.querySelector('.delete-feedback-failed');
     const failedList = fragment.querySelector('.js-delete-failed-list');
+    const failedMore = fragment.querySelector('.js-delete-failed-more');
+    const failedToggle = fragment.querySelector('.js-delete-failed-toggle');
 
     if (summary) summary.textContent = message;
     if (meta && (deletedCount !== null || failedCount !== null)) {
@@ -234,7 +252,20 @@
     }
     if (failedWrap && failedList && failedNames.length > 0) {
       failedWrap.classList.remove('hidden');
-      failedList.innerHTML = failedNames.map((name) => `<code>${escapeHtml(name)}</code>`).join('');
+      const inlineNames = failedNames.slice(0, DELETE_FAILED_INLINE_LIMIT);
+      const hiddenNames = failedNames.slice(DELETE_FAILED_INLINE_LIMIT);
+      failedList.innerHTML = inlineNames.map((name) => `<code>${escapeHtml(name)}</code>`).join('');
+      if (hiddenNames.length > 0 && failedMore && failedToggle) {
+        failedMore.innerHTML = hiddenNames.map((name) => `<code>${escapeHtml(name)}</code>`).join('');
+        failedToggle.classList.remove('hidden');
+        failedToggle.addEventListener('click', () => {
+          const expanded = failedToggle.getAttribute('aria-expanded') === 'true';
+          failedToggle.setAttribute('aria-expanded', expanded ? 'false' : 'true');
+          failedToggle.textContent = expanded ? `展开剩余 ${hiddenNames.length} 项` : '收起';
+          failedMore.classList.toggle('hidden', expanded);
+        });
+        failedToggle.textContent = `展开剩余 ${hiddenNames.length} 项`;
+      }
     }
 
     deleteFeedbackBox.innerHTML = '';
@@ -462,6 +493,10 @@
       }),
     });
 
+    if (init.remote_reconcile_degraded && init.remote_reconcile_warning) {
+      showDeleteFeedback(`⚠️ ${init.remote_reconcile_warning}`, 'error');
+    }
+
     currentUploadId = init.upload_id;
     const chunkSize = init.chunk_size || FALLBACK_CHUNK_SIZE;
     const parallelism = Math.max(1, init.parallelism || FALLBACK_PARALLELISM);
@@ -483,7 +518,11 @@
     };
 
     updateAggregateProgress();
-    detailEl.textContent = init.reused ? '已恢复未完成上传，继续补传剩余分片' : '已创建上传会话，开始并发上传分片';
+    if (init.remote_reconcile_degraded) {
+      detailEl.textContent = '远端对账暂未完成，当前按本地会话状态继续补传；完成前会再次校验';
+    } else {
+      detailEl.textContent = init.reused ? '已恢复未完成上传，继续补传剩余分片' : '已创建上传会话，开始并发上传分片';
+    }
     if ((init.uploaded_parts || []).length > 0) {
       etaEl.textContent = 'ETA 重新估算中';
     }

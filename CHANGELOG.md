@@ -26,7 +26,10 @@ All notable changes to this project will be documented in this file.
 - Upload-part API responses now include structured retry hints (`error_code`, `retryable`, `reason`) to help the frontend decide how to present and handle failures.
 - Multipart session recovery now also reconciles OCI-side uploaded parts before resuming, so restart/reselect flows rely less on stale local metadata.
 - Upload status / completion flow now reuses the reconciled remote part list, allowing the frontend to skip already committed parts more reliably.
+- Multipart resume/status now degrades more gently when OCI-side reconciliation temporarily fails: it returns an explicit warning, continues conservatively from local session state, and keeps final completion checks strict.
 - Delete UX now supports multi-select batch delete, current-result select-all / clear, visible selected-count feedback, keeps the current filtered list context, removes successfully deleted rows inline first, and avoids an immediate hard page reload.
+- Delete failure feedback now folds long failed-object lists, keeping the page compact while still exposing the remaining names on demand.
+- Object list metadata is now richer and clearer, showing a lightweight type label, MIME, creation time, and exact byte size.
 - Delete success / failure messages now include clearer object-specific details, including partial-failure feedback for batch delete.
 - README updated with deployment guidance, proxy/Cloudflare advice, resumable upload notes, benchmark notes, delete support, current recommended defaults, and upload reliability notes.
 

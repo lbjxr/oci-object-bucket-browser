@@ -32,10 +32,25 @@ def build_upload_error_payload(*, part_num: int, exc: OCIStorageError) -> dict[s
     }
 
 
-def format_size_mb(size: int | None) -> str:
+def format_size_display(size: int | None) -> str:
     if size is None:
         return ""
-    return f"{size / 1024 / 1024:.2f} MB"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    value = float(size)
+    unit_index = 0
+    while value >= 1024 and unit_index < len(units) - 1:
+        value /= 1024
+        unit_index += 1
+    if unit_index == 0:
+        return f"{int(value)} {units[unit_index]}"
+    precision = 0 if value >= 10 else 1
+    return f"{value:.{precision}f} {units[unit_index]}"
+
+
+def format_exact_size(size: int | None) -> str:
+    if size is None:
+        return ""
+    return f"{size:,} B"
 
 
 def format_time_to_seconds(value: str | None) -> str:
@@ -66,12 +81,34 @@ def file_icon_for(content_type: str | None) -> str:
     return "📄"
 
 
+def file_type_label_for(content_type: str | None) -> str:
+    if not content_type:
+        return "未知类型"
+    if is_image_type(content_type):
+        return "图片"
+    if is_pdf_type(content_type):
+        return "PDF"
+    if is_text_type(content_type):
+        return "文本"
+    if "zip" in content_type or "compressed" in content_type:
+        return "压缩包"
+    if content_type.startswith("video/"):
+        return "视频"
+    if content_type.startswith("audio/"):
+        return "音频"
+    if content_type.startswith("application/"):
+        return "应用文件"
+    return "文件"
+
+
 def enrich_objects(objects):
     for obj in objects:
-        setattr(obj, "size_mb", format_size_mb(obj.size))
+        setattr(obj, "size_mb", format_size_display(obj.size))
+        setattr(obj, "size_exact", format_exact_size(obj.size))
         setattr(obj, "time_display", format_time_to_seconds(obj.time_created))
         setattr(obj, "is_image", is_image_type(obj.content_type or ""))
         setattr(obj, "file_icon", file_icon_for(obj.content_type))
+        setattr(obj, "file_type_label", file_type_label_for(obj.content_type))
     return objects
 
 
@@ -163,6 +200,18 @@ async def reconcile_multipart_session_with_remote(store, storage, session: Uploa
 
     updated = store.update(session.upload_id, mutator)
     return updated, True
+
+
+async def try_reconcile_multipart_session_with_remote(store, storage, session: UploadSession) -> tuple[UploadSession, bool, bool, str | None]:
+    try:
+        updated, reconciled = await reconcile_multipart_session_with_remote(store, storage, session)
+        return updated, reconciled, False, None
+    except Exception as exc:
+        warning = (
+            "本次未完成 OCI 远端分片对账，已按本地上传会话状态继续恢复。"
+            f"为安全起见，最终合并前仍会再次校验。异常信息：{exc}"
+        )
+        return session, False, True, warning
 
 
 class UploadInitRequest(BaseModel):
@@ -287,8 +336,10 @@ async def init_upload(request: Request, payload: UploadInitRequest = Body(...)):
     existing = store.find_active_by_fingerprint(fingerprint)
     if existing and existing.strategy == strategy:
         reconciled = False
+        degraded_to_local_state = False
+        reconcile_warning = None
         if strategy != "single-put":
-            existing, reconciled = await reconcile_multipart_session_with_remote(store, storage, existing)
+            existing, reconciled, degraded_to_local_state, reconcile_warning = await try_reconcile_multipart_session_with_remote(store, storage, existing)
         return {
             "ok": True,
             "reused": True,
@@ -301,7 +352,13 @@ async def init_upload(request: Request, payload: UploadInitRequest = Body(...)):
             "uploaded_parts": existing.uploaded_part_numbers,
             "uploaded_bytes": existing.uploaded_bytes,
             "reconciled_with_remote": reconciled,
-            "message": "已恢复之前未完成的上传会话" if not reconciled else "已恢复上传会话，并按 OCI 远端分片状态完成对账",
+            "remote_reconcile_degraded": degraded_to_local_state,
+            "remote_reconcile_warning": reconcile_warning,
+            "message": (
+                "已恢复上传会话，并按 OCI 远端分片状态完成对账"
+                if reconciled
+                else "已恢复之前未完成的上传会话"
+            ),
         }
 
     multipart_upload_id = None
@@ -410,8 +467,10 @@ async def get_upload_status(request: Request, upload_id: str):
     if not session:
         raise HTTPException(status_code=404, detail="上传会话不存在")
     reconciled = False
+    degraded_to_local_state = False
+    reconcile_warning = None
     if session.strategy != "single-put" and not session.completed:
-        session, reconciled = await reconcile_multipart_session_with_remote(store, get_storage(), session)
+        session, reconciled, degraded_to_local_state, reconcile_warning = await try_reconcile_multipart_session_with_remote(store, get_storage(), session)
     return {
         "ok": True,
         "upload_id": session.upload_id,
@@ -426,6 +485,8 @@ async def get_upload_status(request: Request, upload_id: str):
         "completed": session.completed,
         "multipart_upload_id": session.multipart_upload_id,
         "reconciled_with_remote": reconciled,
+        "remote_reconcile_degraded": degraded_to_local_state,
+        "remote_reconcile_warning": reconcile_warning,
     }
 
 

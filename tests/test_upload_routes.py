@@ -253,8 +253,54 @@ def test_resume_reconciles_remote_parts_when_local_session_is_stale(tmp_path):
     resumed_payload = resumed.json()
     assert resumed_payload['reused'] is True
     assert resumed_payload['reconciled_with_remote'] is True
+    assert resumed_payload['remote_reconcile_degraded'] is False
+    assert resumed_payload['remote_reconcile_warning'] is None
     assert resumed_payload['uploaded_parts'] == [1, 2]
     assert resumed_payload['uploaded_bytes'] == 16 * 1024 * 1024
+
+
+
+def test_resume_degrades_to_local_session_when_remote_reconcile_fails(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    init = client.post(
+        '/api/uploads/init',
+        json={
+            'filename': 'big.bin',
+            'file_size': 20 * 1024 * 1024,
+            'content_type': 'application/octet-stream',
+            'file_fingerprint': 'reconcile-fallback',
+        },
+    )
+    upload_id = init.json()['upload_id']
+
+    client.put(
+        f'/api/uploads/{upload_id}/part/1',
+        content=b'a' * (8 * 1024 * 1024),
+        headers={'Content-Type': 'application/octet-stream'},
+    )
+
+    def boom(**kwargs):
+        raise RuntimeError('remote list failed')
+
+    fake_storage.list_multipart_uploaded_parts = boom
+
+    resumed = client.post(
+        '/api/uploads/init',
+        json={
+            'filename': 'big.bin',
+            'file_size': 20 * 1024 * 1024,
+            'content_type': 'application/octet-stream',
+            'file_fingerprint': 'reconcile-fallback',
+        },
+    )
+    assert resumed.status_code == 200
+    resumed_payload = resumed.json()
+    assert resumed_payload['reused'] is True
+    assert resumed_payload['reconciled_with_remote'] is False
+    assert resumed_payload['remote_reconcile_degraded'] is True
+    assert '本次未完成 OCI 远端分片对账' in resumed_payload['remote_reconcile_warning']
+    assert resumed_payload['uploaded_parts'] == [1]
+    assert resumed_payload['uploaded_bytes'] == 8 * 1024 * 1024
 
 
 
@@ -290,6 +336,8 @@ def test_status_reconcile_removes_local_parts_missing_on_remote(tmp_path):
     assert status.status_code == 200
     payload = status.json()
     assert payload['reconciled_with_remote'] is True
+    assert payload['remote_reconcile_degraded'] is False
+    assert payload['remote_reconcile_warning'] is None
     assert payload['uploaded_parts'] == [1]
     assert payload['uploaded_bytes'] == 8 * 1024 * 1024
 
