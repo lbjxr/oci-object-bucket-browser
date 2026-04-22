@@ -1,136 +1,88 @@
 # Project Status and Roadmap
 
-## Current status
+## 当前状态
 
-`oci-object-bucket-browser` is now in a practical **v1.0.0** state.
+`oci-object-bucket-browser` 现在已经是一套可用的轻量对象存储 Web 面板了。
 
-It is no longer just an MVP demo page. It already works as a lightweight OCI Object Storage web panel for real-world self-use and small internal scenarios.
+适合：
+- 自用 bucket 管理
+- 小团队内部文件站
+- OCI Object Storage 的轻量管理页
 
-### What is already working
+## 已完成
 
-#### Core panel features
-- Single-account login.
-- Object listing.
-- Prefix filtering.
-- Object download.
-- Text preview.
-- Image preview.
-- PDF preview.
-- Image thumbnails.
-- File-type icons.
-- Mobile-friendly layout.
-- `systemd` deployment.
+### 基础能力
+- 单账号登录
+- 对象列表
+- 前缀过滤
+- 下载
+- 文本 / 图片 / PDF 预览
+- 图片缩略图
+- 文件类型图标
+- 移动端友好布局
+- systemd 部署
 
-#### Upload features
-- Small-file direct upload.
-- Large-file multipart upload.
-- Multipart parallel upload.
-- Lightweight resumable upload.
-- Upload cancel.
-- Progress, speed, ETA, success prompt.
-- Basic failed-part auto retry.
+### 上传能力
+- 小文件直传
+- 大文件 multipart 上传
+- 分片并发上传
+- 上传进度、速度、ETA
+- 上传取消
+- 轻量恢复型断点续传
+- 分片失败自动重试
+- 错误分类与更清楚的失败提示
+- OCI 远端 parts 对账恢复
+- 远端对账失败时的保守降级恢复
 
-#### Object management
-- Single-object delete from the list.
-- Confirmation before delete.
-- Clearer inline delete success / failure feedback.
-- Inline row removal after successful delete while keeping current filter context.
+### 对象管理
+- 单对象删除
+- 批量删除
+- 全选当前结果
+- 清空选择
+- 已选数量显示
+- 删除成功对象局部移除
+- 删除失败反馈增强
+- 删除失败长列表折叠
+- 更清楚的对象元信息展示
 
-## Current recommended defaults
+## 当前推荐默认值
 
 - `APP_UPLOAD_CHUNK_SIZE_MB=16`
 - `APP_UPLOAD_PARALLELISM=6`
 - `APP_UPLOAD_SINGLE_PUT_THRESHOLD_MB=32`
 
-## Practical conclusions from current testing
+## 当前边界
 
-- Resume flow has been verified in real use.
-- Missing parts can be resumed without re-uploading completed parts.
-- Multipart completion is stable after the upload-session write-loss fix.
-- Current speed display is more realistic after moving to a recent sliding-window average.
-- Object delete is now available for cleaning uploaded test files directly from the UI.
+- 断点恢复还是轻量方案，不是完整网盘级续传
+- 上传重试策略已经增强，但还可以继续细化
+- 还没有批量下载
+- 还没有重命名 / 移动
+- 还没有目录树视图
+- 还没有多用户权限体系
 
-## Known boundaries in v1.0.0
+## 下一步建议
 
-- Resume support is lightweight, not full cloud-drive-grade resumable upload.
-- Retry policy is still a basic first version.
-- No OCI-side multipart reconciliation after restart yet.
-- No batch object actions yet.
-- No rename / move feature yet.
+### P1
+上传限流 / `429` 场景再细化
 
-## Next task list
+### P2
+删除失败项一键重试
 
-The following phases remain the active next-step task list.
+### P3
+批量下载
 
-### Phase 1 — short-term polish and usability
+### P4
+更强的目录感 / 目录树浏览
 
-#### P1.1 Delete workflow polish (highest priority in this phase)
-Deletion is already available and the latest iteration already improved this line with clearer feedback, inline row removal, and filter-context retention.
+### P5
+更丰富的对象元信息与预览能力
 
-Suggested follow-up:
-- Consider optional undo-style affordance if later needed.
-- Consider lightweight protection for dangerous names or folders if later needed.
-- Consider more structured error typing if OCI returns richer delete failures.
+## 一句话总结
 
-#### P1.2 Changelog / release-note maintenance
-- Keep `CHANGELOG.md` updated after each meaningful iteration.
-- Keep release notes aligned with actual shipped behavior.
+这项目现在已经过了“纯 MVP”阶段。
 
-#### P1.3 UI wording polish
-- Clarify terms like “current speed” vs. “average speed”.
-- Reduce ambiguity in upload / retry / delete states.
-
-### Phase 2 — upload reliability and diagnostics
-
-#### P2.1 Smarter retry policy
-- Different retry behavior for timeout / connection reset / 5xx.
-- Better retry messages.
-- Optional retry cap tuning via config.
-
-#### P2.2 Multipart reconciliation
-- Query OCI multipart parts when needed.
-- Reconcile local session metadata with remote uploaded parts.
-- Improve restart-time recovery confidence.
-
-#### P2.3 Better observability
-- Record upload start / finish / commit timing.
-- Make average throughput calculation easier to verify.
-- Improve debug visibility for slow or failed uploads.
-
-### Phase 3 — richer object-management experience
-
-#### P3.1 Batch object actions
-- Batch delete.
-- Batch download helpers.
-- Multi-select object operations.
-
-#### P3.2 Richer object metadata view
-- ETag.
-- Last-Modified.
-- Storage tier.
-- Custom metadata.
-
-#### P3.3 Stronger browsing model
-- Better pseudo-directory experience.
-- More intuitive navigation for large buckets.
-- Optional directory-tree style browsing.
-
-## Priority summary
-
-If only one next step is chosen, it should be:
-
-> **Continue improving object deletion UX first**
-
-Reason:
-- It solves an immediate real cleanup need.
-- It is already partially implemented.
-- It has direct value after upload testing.
-- It is lower risk than more complex multipart engineering.
-
-After that, the best technical next step is:
-
-> **Upload reliability / diagnostics improvements**
-
-And only then:
-
-> **Richer object-management UX such as batch actions and stronger browsing**
+下一步重点不是补最基本功能，
+而是继续做：
+- 上传可靠性加固
+- 删除体验打磨
+- 对象管理增强
