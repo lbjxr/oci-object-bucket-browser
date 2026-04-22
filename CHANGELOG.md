@@ -24,15 +24,18 @@ All notable changes to this project will be documented in this file.
 - Multipart part retry policy now distinguishes timeout / connection interruption / HTTP 5xx / HTTP 4xx-like failures instead of applying the same basic retry behavior to every error.
 - Multipart upload status text now shows clearer failure reasons, whether the browser will retry, and when retrying has already stopped.
 - Upload-part API responses now include structured retry hints (`error_code`, `retryable`, `reason`) to help the frontend decide how to present and handle failures.
+- Multipart session recovery now also reconciles OCI-side uploaded parts before resuming, so restart/reselect flows rely less on stale local metadata.
+- Upload status / completion flow now reuses the reconciled remote part list, allowing the frontend to skip already committed parts more reliably.
 - Delete UX now supports multi-select batch delete, current-result select-all / clear, visible selected-count feedback, keeps the current filtered list context, removes successfully deleted rows inline first, and avoids an immediate hard page reload.
 - Delete success / failure messages now include clearer object-specific details, including partial-failure feedback for batch delete.
-- README updated with deployment guidance, proxy/Cloudflare advice, resumable upload notes, benchmark notes, delete support, current recommended defaults, and the first-round upload reliability notes.
+- README updated with deployment guidance, proxy/Cloudflare advice, resumable upload notes, benchmark notes, delete support, current recommended defaults, and upload reliability notes.
 
 ### Fixed
 - Fixed multipart upload progress feeling “stuck” for large chunks.
 - Fixed upload session state loss caused by concurrent session writes.
 - Fixed failed-part handling so only failed parts retry, without polluting already uploaded state.
 - Fixed resume flow so previously uploaded parts can be skipped correctly after retry/reselect.
+- Fixed restart/local-state-drift recovery so missing local parts can be rebuilt from OCI remote multipart state, and stale local-only parts are dropped conservatively.
 - Fixed object delete flow so uploaded test files can be removed directly from the UI.
 - Fixed bulk delete flow so successful objects are removed inline even when part of the batch fails.
 
@@ -42,6 +45,6 @@ All notable changes to this project will be documented in this file.
 - Stable transfer phase observed around `3.5 MB/s`, with peaks around `4 MB/s`.
 
 ### Known limitations
-- Resume support is lightweight and primarily aimed at same-browser reselection / refresh recovery.
+- Resume support is still lightweight and primarily aimed at same-browser reselection / refresh recovery.
 - Retry policy is smarter than before, but still remains a frontend-led first version rather than a fully adaptive upload scheduler.
-- OCI-side multipart part reconciliation after service restart is not yet implemented.
+- Remote reconciliation currently trusts OCI's listed part numbers + ETags and reconstructs expected part sizes from session total size/chunk size; it does not independently verify remote byte length per part.

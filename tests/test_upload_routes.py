@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -24,6 +25,7 @@ def make_client(tmp_path: Path):
             self.single_uploads = []
             self.multipart_created = []
             self.parts = {}
+            self.remote_parts = {}
             self.commits = []
             self.aborts = []
             self.upload_part_calls = []
@@ -49,7 +51,16 @@ def make_client(tmp_path: Path):
                 self.fail_parts[part_num] = remaining_failures - 1
                 raise RuntimeError(f'boom-part-{part_num}')
             self.parts[(multipart_upload_id, part_num)] = payload
-            return f'etag-{part_num}'
+            etag = f'etag-{part_num}'
+            self.remote_parts[(multipart_upload_id, part_num)] = etag
+            return etag
+
+        def list_multipart_uploaded_parts(self, *, object_name, multipart_upload_id):
+            return {
+                part_num: etag
+                for (upload_id, part_num), etag in self.remote_parts.items()
+                if upload_id == multipart_upload_id
+            }
 
         def commit_multipart_upload(self, *, object_name, multipart_upload_id, parts):
             self.commits.append((object_name, multipart_upload_id, parts))
@@ -201,6 +212,113 @@ def test_upload_part_returns_existing_etag_when_part_already_uploaded(tmp_path):
     assert second.status_code == 200
     assert second.json()['already_uploaded'] is True
     assert fake_storage.upload_part_calls == [('mp-1', 1, 8 * 1024 * 1024)]
+
+
+
+def test_resume_reconciles_remote_parts_when_local_session_is_stale(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    init = client.post(
+        '/api/uploads/init',
+        json={
+            'filename': 'big.bin',
+            'file_size': 20 * 1024 * 1024,
+            'content_type': 'application/octet-stream',
+            'file_fingerprint': 'remote-reconcile',
+        },
+    )
+    upload_id = init.json()['upload_id']
+    session_file = tmp_path / 'upload-sessions' / f'{upload_id}.json'
+
+    client.put(
+        f'/api/uploads/{upload_id}/part/1',
+        content=b'a' * (8 * 1024 * 1024),
+        headers={'Content-Type': 'application/octet-stream'},
+    )
+    fake_storage.remote_parts[('mp-1', 2)] = 'etag-2'
+
+    payload = json.loads(session_file.read_text(encoding='utf-8'))
+    payload['uploaded_parts'] = {}
+    session_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    resumed = client.post(
+        '/api/uploads/init',
+        json={
+            'filename': 'big.bin',
+            'file_size': 20 * 1024 * 1024,
+            'content_type': 'application/octet-stream',
+            'file_fingerprint': 'remote-reconcile',
+        },
+    )
+    assert resumed.status_code == 200
+    resumed_payload = resumed.json()
+    assert resumed_payload['reused'] is True
+    assert resumed_payload['reconciled_with_remote'] is True
+    assert resumed_payload['uploaded_parts'] == [1, 2]
+    assert resumed_payload['uploaded_bytes'] == 16 * 1024 * 1024
+
+
+
+def test_status_reconcile_removes_local_parts_missing_on_remote(tmp_path):
+    client, _ = make_client(tmp_path)
+    init = client.post(
+        '/api/uploads/init',
+        json={
+            'filename': 'big.bin',
+            'file_size': 20 * 1024 * 1024,
+            'content_type': 'application/octet-stream',
+            'file_fingerprint': 'drop-ghost-part',
+        },
+    )
+    upload_id = init.json()['upload_id']
+
+    client.put(
+        f'/api/uploads/{upload_id}/part/1',
+        content=b'a' * (8 * 1024 * 1024),
+        headers={'Content-Type': 'application/octet-stream'},
+    )
+
+    session_file = tmp_path / 'upload-sessions' / f'{upload_id}.json'
+    payload = json.loads(session_file.read_text(encoding='utf-8'))
+    payload['uploaded_parts']['2'] = {
+        'part_num': 2,
+        'etag': 'ghost-etag-2',
+        'size': 8 * 1024 * 1024,
+    }
+    session_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    status = client.get(f'/api/uploads/{upload_id}')
+    assert status.status_code == 200
+    payload = status.json()
+    assert payload['reconciled_with_remote'] is True
+    assert payload['uploaded_parts'] == [1]
+    assert payload['uploaded_bytes'] == 8 * 1024 * 1024
+
+
+
+def test_complete_reconciles_remote_parts_before_commit(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    init = client.post(
+        '/api/uploads/init',
+        json={
+            'filename': 'big.bin',
+            'file_size': 20 * 1024 * 1024,
+            'content_type': 'application/octet-stream',
+            'file_fingerprint': 'complete-reconcile',
+        },
+    )
+    upload_id = init.json()['upload_id']
+
+    client.put(
+        f'/api/uploads/{upload_id}/part/1',
+        content=b'a' * (8 * 1024 * 1024),
+        headers={'Content-Type': 'application/octet-stream'},
+    )
+    fake_storage.remote_parts[('mp-1', 2)] = 'etag-2'
+    fake_storage.remote_parts[('mp-1', 3)] = 'etag-3'
+
+    complete = client.post(f'/api/uploads/{upload_id}/complete')
+    assert complete.status_code == 200
+    assert fake_storage.commits[0][2] == [(1, 'etag-1'), (2, 'etag-2'), (3, 'etag-3')]
 
 
 

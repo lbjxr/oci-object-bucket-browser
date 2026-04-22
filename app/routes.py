@@ -14,7 +14,7 @@ from pydantic import BaseModel
 
 from app.config import get_settings
 from app.oci_client import OCIStorageError, OCIStorageService, classify_upload_exception
-from app.upload_sessions import UploadedPart, UploadSessionStore
+from app.upload_sessions import UploadSession, UploadedPart, UploadSessionStore
 from app.utils import is_image_type, is_pdf_type, is_text_type, object_name_from_upload, to_data_url
 
 router = APIRouter()
@@ -110,6 +110,59 @@ def template_context(request: Request, **extra: object) -> dict[str, object]:
 def build_upload_fingerprint(*, object_name: str, file_size: int, chunk_size: int, file_fingerprint: str) -> str:
     payload = f"{object_name}|{file_size}|{chunk_size}|{file_fingerprint}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _expected_part_size(session: UploadSession, part_num: int) -> int:
+    expected_parts = (session.total_size + session.chunk_size - 1) // session.chunk_size
+    if expected_parts <= 0:
+        return 0
+    if part_num < expected_parts:
+        return session.chunk_size
+    if part_num == expected_parts:
+        tail = session.total_size - session.chunk_size * (expected_parts - 1)
+        return max(0, tail)
+    return 0
+
+
+async def reconcile_multipart_session_with_remote(store, storage, session: UploadSession) -> tuple[UploadSession, bool]:
+    if session.strategy == "single-put" or session.completed or not session.multipart_upload_id:
+        return session, False
+
+    remote_parts = await run_in_threadpool(
+        storage.list_multipart_uploaded_parts,
+        object_name=session.object_name,
+        multipart_upload_id=session.multipart_upload_id,
+    )
+    expected_parts = (session.total_size + session.chunk_size - 1) // session.chunk_size
+    filtered_remote_parts = {
+        part_num: etag
+        for part_num, etag in remote_parts.items()
+        if 1 <= part_num <= expected_parts and etag
+    }
+
+    local_parts = session.uploaded_parts
+    changed = len(filtered_remote_parts) != len(local_parts)
+    if not changed:
+        for part_num, part in local_parts.items():
+            if filtered_remote_parts.get(part_num) != part.etag:
+                changed = True
+                break
+
+    if not changed:
+        return session, False
+
+    def mutator(s: UploadSession) -> None:
+        s.uploaded_parts = {
+            part_num: UploadedPart(
+                part_num=part_num,
+                etag=etag,
+                size=_expected_part_size(s, part_num),
+            )
+            for part_num, etag in sorted(filtered_remote_parts.items())
+        }
+
+    updated = store.update(session.upload_id, mutator)
+    return updated, True
 
 
 class UploadInitRequest(BaseModel):
@@ -230,8 +283,12 @@ async def init_upload(request: Request, payload: UploadInitRequest = Body(...)):
     )
 
     store = get_upload_store()
+    storage = get_storage()
     existing = store.find_active_by_fingerprint(fingerprint)
     if existing and existing.strategy == strategy:
+        reconciled = False
+        if strategy != "single-put":
+            existing, reconciled = await reconcile_multipart_session_with_remote(store, storage, existing)
         return {
             "ok": True,
             "reused": True,
@@ -243,12 +300,13 @@ async def init_upload(request: Request, payload: UploadInitRequest = Body(...)):
             "parallelism": existing.parallelism,
             "uploaded_parts": existing.uploaded_part_numbers,
             "uploaded_bytes": existing.uploaded_bytes,
-            "message": "已恢复之前未完成的上传会话",
+            "reconciled_with_remote": reconciled,
+            "message": "已恢复之前未完成的上传会话" if not reconciled else "已恢复上传会话，并按 OCI 远端分片状态完成对账",
         }
 
     multipart_upload_id = None
     if strategy != "single-put":
-        multipart_upload_id = await run_in_threadpool(get_storage().create_multipart_upload, object_name, content_type)
+        multipart_upload_id = await run_in_threadpool(storage.create_multipart_upload, object_name, content_type)
 
     session = store.create(
         object_name=object_name,
@@ -271,6 +329,7 @@ async def init_upload(request: Request, payload: UploadInitRequest = Body(...)):
         "parallelism": session.parallelism,
         "uploaded_parts": session.uploaded_part_numbers,
         "uploaded_bytes": session.uploaded_bytes,
+        "reconciled_with_remote": False,
         "message": "已创建上传会话",
     }
 
@@ -344,11 +403,15 @@ async def upload_part(request: Request, response: Response, upload_id: str, part
 
 
 @router.get("/api/uploads/{upload_id}")
-def get_upload_status(request: Request, upload_id: str):
+async def get_upload_status(request: Request, upload_id: str):
     require_login(request)
-    session = get_upload_store().get(upload_id)
+    store = get_upload_store()
+    session = store.get(upload_id)
     if not session:
         raise HTTPException(status_code=404, detail="上传会话不存在")
+    reconciled = False
+    if session.strategy != "single-put" and not session.completed:
+        session, reconciled = await reconcile_multipart_session_with_remote(store, get_storage(), session)
     return {
         "ok": True,
         "upload_id": session.upload_id,
@@ -362,6 +425,7 @@ def get_upload_status(request: Request, upload_id: str):
         "uploaded_bytes": session.uploaded_bytes,
         "completed": session.completed,
         "multipart_upload_id": session.multipart_upload_id,
+        "reconciled_with_remote": reconciled,
     }
 
 
@@ -385,6 +449,7 @@ async def complete_upload(request: Request, upload_id: str):
     if session.strategy == "single-put":
         raise HTTPException(status_code=400, detail="single-put 上传无需调用 complete 接口")
 
+    session, _ = await reconcile_multipart_session_with_remote(store, storage, session)
     expected_parts = (session.total_size + session.chunk_size - 1) // session.chunk_size
     missing = [part_num for part_num in range(1, expected_parts + 1) if part_num not in session.uploaded_parts]
     if missing:
