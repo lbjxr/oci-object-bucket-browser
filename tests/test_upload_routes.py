@@ -76,8 +76,34 @@ def make_client(tmp_path: Path):
         def list_objects(self, prefix=''):
             return []
 
-        def open_stream(self, object_name):
-            raise AssertionError('not used in this test')
+        def head_object(self, object_name):
+            from app.models import ObjectDownloadInfo
+            payload = getattr(self, 'download_payloads', {}).get(object_name)
+            if payload is None:
+                raise AssertionError(f'unexpected head_object for {object_name}')
+            return ObjectDownloadInfo(
+                size=len(payload),
+                etag=f'etag-{object_name}',
+                content_type='application/octet-stream',
+            )
+
+        def open_stream(self, object_name, *, range_header=None):
+            payload = getattr(self, 'download_payloads', {}).get(object_name)
+            if payload is None:
+                raise AssertionError(f'unexpected open_stream for {object_name}')
+            from io import BytesIO
+            headers = {'content-length': str(len(payload)), 'etag': f'etag-{object_name}'}
+            if range_header:
+                unit, raw = range_header.split('=', 1)
+                assert unit == 'bytes'
+                start_text, end_text = raw.split('-', 1)
+                start = int(start_text)
+                end = int(end_text)
+                sliced = payload[start:end + 1]
+                headers['content-length'] = str(len(sliced))
+                headers['content-range'] = f'bytes {start}-{end}/{len(payload)}'
+                return BytesIO(sliced), 'application/octet-stream', headers
+            return BytesIO(payload), 'application/octet-stream', headers
 
         def get_preview(self, object_name):
             raise AssertionError('not used in this test')
@@ -122,6 +148,154 @@ def test_init_upload_session_returns_parallelism_and_strategy(tmp_path):
     assert payload['parallelism'] == 3
     assert payload['uploaded_parts'] == []
     assert payload['uploaded_bytes'] == 0
+
+
+def test_index_includes_dynamic_throttle_concurrency_copy(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+
+    class _Object:
+        def __init__(self):
+            self.name = 'docs/a.txt'
+            self.size = 12
+            self.etag = 'etag-a'
+            self.time_created = '2026-04-22T10:00:00+00:00'
+            self.content_type = 'text/plain'
+
+    fake_storage.list_objects = lambda prefix='': [_Object()]
+
+    response = client.get('/')
+    assert response.status_code == 200
+    html = response.text
+    assert 'THROTTLE_STREAK_REDUCE_THRESHOLD = 2' in html
+    assert '限流收敛至 ${targetConcurrency}/${parallelism} 路' in html
+    assert '已临时下调上传并发到 ${targetConcurrency}/${parallelism} 路' in html
+    assert '下载所选' in html
+    assert '/objects/batch-download' in html
+
+
+
+def test_batch_download_returns_zip_of_selected_objects(tmp_path):
+    import io
+    import zipfile
+
+    client, fake_storage = make_client(tmp_path)
+    fake_storage.download_payloads = {
+        'docs/a.txt': b'hello-a',
+        'images/b.png': b'hello-b',
+    }
+
+    response = client.post(
+        '/objects/batch-download?prefix=docs/',
+        json={'object_names': ['docs/a.txt', 'images/b.png', 'docs/a.txt']},
+    )
+    assert response.status_code == 200
+    assert response.headers['content-type'].startswith('application/zip')
+    assert 'attachment; filename="oci-batch-docs-2items-' in response.headers['content-disposition']
+    assert response.headers['x-batch-requested-count'] == '2'
+    assert response.headers['x-batch-archived-count'] == '2'
+    assert response.headers['x-batch-failed-count'] == '0'
+    assert response.headers['x-batch-partial'] == '0'
+
+    archive = zipfile.ZipFile(io.BytesIO(response.content))
+    assert sorted(archive.namelist()) == ['docs/a.txt', 'images/b.png']
+    assert archive.read('docs/a.txt') == b'hello-a'
+    assert archive.read('images/b.png') == b'hello-b'
+
+
+
+def test_batch_download_skips_failed_objects_and_emits_failure_manifest(tmp_path):
+    import io
+    import json as _json
+    import zipfile
+
+    client, fake_storage = make_client(tmp_path)
+    fake_storage.download_payloads = {
+        'docs/a.txt': b'hello-a',
+        'images/b.png': b'hello-b',
+    }
+
+    response = client.post(
+        '/objects/batch-download?prefix=mixed/',
+        json={'object_names': ['docs/a.txt', 'missing/c.txt', 'images/b.png']},
+    )
+    assert response.status_code == 200
+    assert response.headers['x-batch-requested-count'] == '3'
+    assert response.headers['x-batch-archived-count'] == '2'
+    assert response.headers['x-batch-failed-count'] == '1'
+    assert response.headers['x-batch-partial'] == '1'
+
+    archive = zipfile.ZipFile(io.BytesIO(response.content))
+    assert sorted(archive.namelist()) == [
+        '_batch_download_failures.json',
+        '_batch_download_failures.txt',
+        'docs/a.txt',
+        'images/b.png',
+    ]
+    manifest = _json.loads(archive.read('_batch_download_failures.json').decode('utf-8'))
+    assert manifest['requested_count'] == 3
+    assert manifest['archived_count'] == 2
+    assert manifest['failed_count'] == 1
+    assert manifest['failed'] == [
+        {'object_name': 'missing/c.txt', 'detail': '异常信息：unexpected open_stream for missing/c.txt'}
+    ]
+    failure_text = archive.read('_batch_download_failures.txt').decode('utf-8')
+    assert 'missing/c.txt' in failure_text
+    assert '其他成功对象已正常导出' in failure_text
+
+
+
+def test_batch_download_fails_when_all_objects_fail(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    fake_storage.download_payloads = {}
+
+    response = client.post(
+        '/objects/batch-download',
+        json={'object_names': ['missing/a.txt', 'missing/b.txt']},
+    )
+    assert response.status_code == 500
+    assert response.json()['detail'] == '批量下载失败：所有对象都未能成功读取，未生成可用 ZIP。'
+
+
+
+def test_download_supports_range_requests(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    fake_storage.download_payloads = {
+        'docs/a.txt': b'0123456789',
+    }
+
+    response = client.get('/download/docs/a.txt', headers={'Range': 'bytes=2-5'})
+    assert response.status_code == 206
+    assert response.content == b'2345'
+    assert response.headers['accept-ranges'] == 'bytes'
+    assert response.headers['content-range'] == 'bytes 2-5/10'
+    assert response.headers['content-length'] == '4'
+    assert response.headers['etag'] == 'etag-docs/a.txt'
+
+
+
+def test_download_supports_suffix_range_requests(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    fake_storage.download_payloads = {
+        'docs/a.txt': b'0123456789',
+    }
+
+    response = client.get('/download/docs/a.txt', headers={'Range': 'bytes=-3'})
+    assert response.status_code == 206
+    assert response.content == b'789'
+    assert response.headers['content-range'] == 'bytes 7-9/10'
+    assert response.headers['content-length'] == '3'
+
+
+
+def test_download_rejects_multi_range_requests(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    fake_storage.download_payloads = {
+        'docs/a.txt': b'0123456789',
+    }
+
+    response = client.get('/download/docs/a.txt', headers={'Range': 'bytes=0-1,4-5'})
+    assert response.status_code == 416
+    assert response.json()['detail'] == '当前仅支持单段 Range 请求'
 
 
 
@@ -212,6 +386,14 @@ def test_upload_part_returns_existing_etag_when_part_already_uploaded(tmp_path):
     assert second.status_code == 200
     assert second.json()['already_uploaded'] is True
     assert fake_storage.upload_part_calls == [('mp-1', 1, 8 * 1024 * 1024)]
+
+
+
+def test_batch_download_requires_selection(tmp_path):
+    client, _ = make_client(tmp_path)
+    response = client.post('/objects/batch-download', json={'object_names': []})
+    assert response.status_code == 400
+    assert response.json()['detail'] == '至少要选择一个对象'
 
 
 
@@ -540,6 +722,42 @@ def test_upload_part_http_4xx_stops_retry_early(tmp_path):
     assert payload['retryable'] is False
     assert payload['error_code'] == 'http_4xx'
     assert 'HTTP 400' in payload['reason']
+
+
+def test_upload_part_http_429_is_retryable_and_returns_retry_after(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+    init = client.post(
+        '/api/uploads/init',
+        json={
+            'filename': 'big.bin',
+            'file_size': 20 * 1024 * 1024,
+            'content_type': 'application/octet-stream',
+            'file_fingerprint': 'http-429-part',
+        },
+    )
+    upload_id = init.json()['upload_id']
+    fake_storage.fail_part_errors[1] = lambda: ServiceError(
+        status=429,
+        code='TooManyRequests',
+        headers={'retry-after': '7'},
+        message='slow down',
+        request_endpoint='/uploadPart',
+        client_version='test',
+        timestamp='now',
+        opc_request_id='req-429',
+    )
+
+    response = client.put(
+        f'/api/uploads/{upload_id}/part/1',
+        content=b'a' * (8 * 1024 * 1024),
+        headers={'Content-Type': 'application/octet-stream'},
+    )
+    assert response.status_code == 429
+    payload = response.json()
+    assert payload['retryable'] is True
+    assert payload['error_code'] == 'http_429'
+    assert payload['retry_after_seconds'] == 7
+    assert '建议等待约 7 秒后再试' in payload['reason']
 
 
 def test_delete_object_requires_login(tmp_path):
