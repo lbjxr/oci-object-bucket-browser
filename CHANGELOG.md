@@ -43,6 +43,7 @@
 - 批量下载改为容错模式：单个对象读取失败时，其他成功对象仍会继续打包导出
 - 若存在失败项，会在 ZIP 内附带 `_batch_download_failures.json` 与 `_batch_download_failures.txt`
 - 批量下载响应头增加 `X-Batch-Requested-Count` / `X-Batch-Archived-Count` / `X-Batch-Failed-Count` / `X-Batch-Partial`
+- 前端会读取这些响应头；若是部分成功，会轻量提示“本次批量下载有部分对象失败，ZIP 内已附失败清单”
 
 ### 单对象下载增强
 - 下载端点支持 `Accept-Ranges: bytes`

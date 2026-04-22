@@ -699,6 +699,12 @@ p {
   border: 1px solid rgba(55, 181, 117, 0.22);
 }
 
+.alert-warning {
+  background: rgba(255, 190, 51, 0.14);
+  color: #8a5b00;
+  border: 1px solid rgba(255, 190, 51, 0.24);
+}
+
 .preview-shell {
   padding: 24px;
 }

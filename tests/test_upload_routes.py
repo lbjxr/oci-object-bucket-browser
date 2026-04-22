@@ -171,6 +171,10 @@ def test_index_includes_dynamic_throttle_concurrency_copy(tmp_path):
     assert '已临时下调上传并发到 ${targetConcurrency}/${parallelism} 路' in html
     assert '下载所选' in html
     assert '/objects/batch-download' in html
+    assert 'batch-download-feedback' in html
+    assert "response.headers.get('X-Batch-Requested-Count')" in html
+    assert '本次批量下载有部分对象失败' in html
+    assert 'ZIP 内已附失败清单' in html
 
 
 

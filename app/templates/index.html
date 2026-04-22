@@ -8,6 +8,7 @@
 {% endif %}
 
 <div id="upload-success" class="alert alert-success hidden" aria-live="polite"></div>
+<div id="batch-download-feedback" class="alert hidden" aria-live="polite"></div>
 
 <div class="grid two-columns form-grid">
   <section class="card panel compact-panel form-panel">
@@ -150,6 +151,7 @@
   const objectList = document.getElementById('object-list');
   const objectCountPill = document.querySelector('.pill');
   const deleteFeedbackBox = document.getElementById('object-delete-feedback');
+  const batchDownloadFeedbackBox = document.getElementById('batch-download-feedback');
   const batchDeleteToolbar = document.getElementById('batch-delete-toolbar');
   const batchDeleteSelection = document.getElementById('batch-delete-selection');
   const batchDeleteButton = document.getElementById('batch-delete-button');
@@ -282,6 +284,19 @@
   const hideDeleteFeedback = () => {
     deleteFeedbackBox.classList.add('hidden');
     deleteFeedbackBox.innerHTML = '';
+  };
+
+  const showBatchDownloadFeedback = (message, type = 'success') => {
+    if (!batchDownloadFeedbackBox) return;
+    batchDownloadFeedbackBox.textContent = message;
+    batchDownloadFeedbackBox.className = `alert ${type === 'error' ? 'alert-error' : type === 'warning' ? 'alert-warning' : 'alert-success'}`;
+    batchDownloadFeedbackBox.classList.remove('hidden');
+  };
+
+  const hideBatchDownloadFeedback = () => {
+    if (!batchDownloadFeedbackBox) return;
+    batchDownloadFeedbackBox.classList.add('hidden');
+    batchDownloadFeedbackBox.textContent = '';
   };
 
   const getObjectRow = (objectName) => objectList ? objectList.querySelector(`[data-object-row][data-object-name="${CSS.escape(objectName)}"]`) : null;
@@ -762,6 +777,7 @@
 
     hideSuccess();
     hideDeleteFeedback();
+    hideBatchDownloadFeedback();
     const originText = batchDownloadButton.textContent;
     batchDownloadButton.disabled = true;
     batchDeleteButton.disabled = true;
@@ -798,9 +814,23 @@
       link.click();
       link.remove();
       window.setTimeout(() => window.URL.revokeObjectURL(objectUrl), 1000);
-      showDeleteFeedback(`✅ 已开始下载打包文件：${filename}`, 'success');
+
+      const requestedCount = Number.parseInt(response.headers.get('X-Batch-Requested-Count') || `${selected.length}`, 10);
+      const archivedCount = Number.parseInt(response.headers.get('X-Batch-Archived-Count') || `${selected.length}`, 10);
+      const failedCount = Number.parseInt(response.headers.get('X-Batch-Failed-Count') || '0', 10);
+      const isPartial = (response.headers.get('X-Batch-Partial') || '0') === '1';
+
+      if (isPartial) {
+        showBatchDownloadFeedback(
+          `⚠️ 本次批量下载有部分对象失败（成功 ${Number.isFinite(archivedCount) ? archivedCount : 0} / 请求 ${Number.isFinite(requestedCount) ? requestedCount : selected.length}，失败 ${Number.isFinite(failedCount) ? failedCount : 0}）。ZIP 内已附失败清单。`,
+          'warning',
+        );
+      } else {
+        const successCount = Number.isFinite(archivedCount) ? archivedCount : selected.length;
+        showBatchDownloadFeedback(`✅ 已开始下载 ZIP：${filename}（共 ${successCount} 项）`, 'success');
+      }
     } catch (error) {
-      showDeleteFeedback(`批量下载失败：${error.message || error}`, 'error');
+      showBatchDownloadFeedback(`批量下载失败：${error.message || error}`, 'error');
     } finally {
       batchDownloadButton.textContent = originText;
       syncBatchDeleteToolbar();
@@ -876,6 +906,7 @@
     const file = fileInput.files && fileInput.files[0];
     filePickerHint.textContent = file ? `${file.name}（${fmtBytes(file.size)}）` : '点击选择要上传的对象';
     hideSuccess();
+    hideBatchDownloadFeedback();
   });
 
   cancelBtn.addEventListener('click', async () => {
@@ -943,6 +974,7 @@
       if (!ok) return;
       hideSuccess();
       hideDeleteFeedback();
+      hideBatchDownloadFeedback();
       button.disabled = true;
       const originText = button.textContent;
       button.textContent = '删除中...';
@@ -982,6 +1014,7 @@
 
     hideSuccess();
     hideDeleteFeedback();
+    hideBatchDownloadFeedback();
     showStatus();
     setBusy();
     currentAbort = false;
