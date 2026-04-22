@@ -102,13 +102,9 @@
               <span class="dot-sep">•</span>
               <span>创建于 {{ obj.time_display }}</span>
               {% endif %}
-              {% if obj.size_exact %}
-              <span class="dot-sep">•</span>
-              <span title="{{ obj.size_exact }}">{{ obj.size_exact }}</span>
-              {% endif %}
             </div>
           </div>
-          <span class="object-size-badge" title="{{ obj.size_exact }}">{{ obj.size_mb }}</span>
+          <span class="object-size-badge">{{ obj.size_mb }}</span>
         </div>
         <div class="object-thumb-wrap">
           {% if obj.is_image %}
