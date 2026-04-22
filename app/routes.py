@@ -9,7 +9,7 @@ from datetime import datetime
 from io import BytesIO
 from urllib.parse import quote
 
-from fastapi import APIRouter, Body, File, Form, HTTPException, Request, Response, UploadFile, status
+from fastapi import APIRouter, Body, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
@@ -700,11 +700,30 @@ def download(request: Request, object_name: str):
 
 
 @router.post("/objects/batch-download")
-def batch_download_objects(request: Request, payload: BatchDownloadRequest = Body(...), prefix: str = ""):
+async def batch_download_objects(request: Request, prefix: str = Query(default="")):
     if not request.session.get("authenticated"):
         return JSONResponse({"detail": "未登录"}, status_code=401)
 
-    object_names = _normalize_object_names(payload.object_names)
+    content_type = (request.headers.get("content-type") or "").lower()
+    effective_prefix = prefix
+    raw_object_names: list[str] = []
+
+    if "application/json" in content_type:
+        try:
+            raw_payload = await request.json()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"批量下载请求体无效：{exc}") from exc
+        try:
+            payload = BatchDownloadRequest.model_validate(raw_payload)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"批量下载请求体无效：{exc}") from exc
+        raw_object_names = payload.object_names
+    else:
+        form = await request.form()
+        effective_prefix = str(form.get("prefix") or prefix)
+        raw_object_names = [str(name) for name in form.getlist("object_names")]
+
+    object_names = _normalize_object_names(raw_object_names)
     if not object_names:
         raise HTTPException(status_code=400, detail="至少要选择一个对象")
 
@@ -754,7 +773,7 @@ def batch_download_objects(request: Request, payload: BatchDownloadRequest = Bod
             raise HTTPException(status_code=500, detail="批量下载失败：所有对象都未能成功读取，未生成可用 ZIP。")
 
         temp_file.seek(0)
-        filename = _build_batch_download_filename(prefix=prefix, object_count=len(object_names))
+        filename = _build_batch_download_filename(prefix=effective_prefix, object_count=len(object_names))
         headers = {
             "Content-Disposition": _content_disposition_attachment(filename),
             "X-Batch-Requested-Count": str(len(object_names)),
