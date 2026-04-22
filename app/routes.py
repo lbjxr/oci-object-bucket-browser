@@ -118,6 +118,73 @@ def enrich_objects(objects):
     return objects
 
 
+def build_prefix_navigation(prefix: str, objects: list[object]) -> dict[str, object]:
+    current_prefix = (prefix or "").strip()
+    stripped = current_prefix.strip("/")
+    segments = [segment for segment in stripped.split("/") if segment]
+
+    breadcrumbs = []
+    running_prefix = ""
+    for segment in segments:
+        running_prefix = f"{running_prefix}{segment}/"
+        breadcrumbs.append(
+            {
+                "label": segment,
+                "prefix": running_prefix,
+                "href": f"/?prefix={quote(running_prefix)}",
+            }
+        )
+
+    parent_prefix = ""
+    if segments:
+        parent_prefix = "/".join(segments[:-1])
+        if parent_prefix:
+            parent_prefix += "/"
+
+    child_prefix_map: dict[str, dict[str, object]] = {}
+    child_base = ""
+    if current_prefix:
+        child_base = current_prefix if current_prefix.endswith("/") else f"{current_prefix}/"
+
+    for obj in objects:
+        name = (getattr(obj, "name", "") or "").strip()
+        if not name:
+            continue
+        if current_prefix and not name.startswith(current_prefix):
+            continue
+
+        remainder = name[len(current_prefix):] if current_prefix else name
+        remainder = remainder.lstrip("/")
+        if not remainder or "/" not in remainder:
+            continue
+
+        child_label = remainder.split("/", 1)[0]
+        if not child_label:
+            continue
+
+        child_prefix = f"{child_base}{child_label}/"
+        item = child_prefix_map.setdefault(
+            child_prefix,
+            {
+                "label": child_label,
+                "prefix": child_prefix,
+                "href": f"/?prefix={quote(child_prefix)}",
+                "object_count": 0,
+            },
+        )
+        item["object_count"] += 1
+
+    child_prefixes = sorted(child_prefix_map.values(), key=lambda item: str(item["label"]).lower())
+
+    return {
+        "current_prefix": current_prefix,
+        "breadcrumbs": breadcrumbs,
+        "parent_prefix": parent_prefix,
+        "parent_href": f"/?prefix={quote(parent_prefix)}" if parent_prefix else "/",
+        "child_prefixes": child_prefixes,
+    }
+
+
 def get_storage() -> OCIStorageService:
     return OCIStorageService()
 
@@ -358,16 +425,23 @@ def index(request: Request, prefix: str = ""):
         return redirect_to_login(request.url.path + (f"?prefix={quote(prefix)}" if prefix else ""))
     try:
         objects = enrich_objects(get_storage().list_objects(prefix=prefix))
+        prefix_navigation = build_prefix_navigation(prefix, objects)
         return templates.TemplateResponse(
             request,
             "index.html",
-            template_context(request, objects=objects, prefix=prefix, error=None),
+            template_context(request, objects=objects, prefix=prefix, prefix_navigation=prefix_navigation, error=None),
         )
     except OCIStorageError as exc:
         return templates.TemplateResponse(
             request,
             "index.html",
-            template_context(request, objects=[], prefix=prefix, error=str(exc)),
+            template_context(
+                request,
+                objects=[],
+                prefix=prefix,
+                prefix_navigation=build_prefix_navigation(prefix, []),
+                error=str(exc),
+            ),
             status_code=500,
         )
 

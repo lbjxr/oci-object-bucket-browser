@@ -177,6 +177,39 @@ def test_index_includes_dynamic_throttle_concurrency_copy(tmp_path):
     assert 'ZIP 内已附失败清单' in html
 
 
+def test_index_renders_prefix_breadcrumbs_and_child_directories(tmp_path):
+    client, fake_storage = make_client(tmp_path)
+
+    class _Object:
+        def __init__(self, name):
+            self.name = name
+            self.size = 12
+            self.etag = f'etag-{name}'
+            self.time_created = '2026-04-22T10:00:00+00:00'
+            self.content_type = 'text/plain'
+
+    fake_storage.list_objects = lambda prefix='': [
+        _Object('docs/2026/apr/report.txt'),
+        _Object('docs/2026/apr/summary.txt'),
+        _Object('docs/2026/may/plan.txt'),
+        _Object('docs/2026/root-note.txt'),
+    ]
+
+    response = client.get('/?prefix=docs/2026/')
+    assert response.status_code == 200
+    html = response.text
+    assert '目录导航' in html
+    assert 'Bucket 根目录' in html
+    assert '返回上级' in html
+    assert '/?prefix=docs/' in html
+    assert '/?prefix=docs/2026/apr/' in html
+    assert '/?prefix=docs/2026/may/' in html
+    assert '📁 apr/' in html
+    assert '📁 may/' in html
+    assert '2 项' in html
+    assert '1 项' in html
+
+
 
 def test_batch_download_returns_zip_of_selected_objects(tmp_path):
     import io

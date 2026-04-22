@@ -83,6 +83,39 @@
     </div>
   </div>
 
+  <section class="prefix-nav" aria-label="目录导航">
+    <div class="prefix-nav-main">
+      <div class="prefix-nav-topline">
+        <span class="prefix-nav-label">当前位置</span>
+        {% if prefix_navigation.current_prefix %}
+        <a class="prefix-nav-parent" href="{{ prefix_navigation.parent_href }}">← 返回上级</a>
+        {% endif %}
+      </div>
+
+      <div class="prefix-breadcrumbs">
+        <a class="prefix-crumb {% if not prefix_navigation.current_prefix %}is-current{% endif %}" href="/">Bucket 根目录</a>
+        {% for crumb in prefix_navigation.breadcrumbs %}
+        <span class="prefix-crumb-sep">/</span>
+        <a class="prefix-crumb {% if loop.last %}is-current{% endif %}" href="{{ crumb.href }}">{{ crumb.label }}</a>
+        {% endfor %}
+      </div>
+    </div>
+
+    {% if prefix_navigation.child_prefixes %}
+    <div class="prefix-child-nav">
+      <div class="prefix-child-title">当前层级的子目录</div>
+      <div class="prefix-child-list">
+        {% for child in prefix_navigation.child_prefixes %}
+        <a class="prefix-child-chip" href="{{ child.href }}">
+          <span class="prefix-child-name">📁 {{ child.label }}/</span>
+          <span class="prefix-child-meta">{{ child.object_count }} 项</span>
+        </a>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+  </section>
+
   <div id="object-list" class="object-list single-list" data-current-prefix="{{ prefix }}">
     {% for obj in objects %}
     <article class="object-card object-card-unified object-row-card" data-object-row data-object-name="{{ obj.name }}">
