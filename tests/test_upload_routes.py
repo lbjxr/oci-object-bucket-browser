@@ -124,6 +124,16 @@ def test_init_upload_session_returns_parallelism_and_strategy(tmp_path):
     assert payload['uploaded_bytes'] == 0
 
 
+def test_index_includes_dynamic_throttle_concurrency_copy(tmp_path):
+    client, _ = make_client(tmp_path)
+    response = client.get('/')
+    assert response.status_code == 200
+    html = response.text
+    assert 'THROTTLE_STREAK_REDUCE_THRESHOLD = 2' in html
+    assert '限流收敛至 ${targetConcurrency}/${parallelism} 路' in html
+    assert '已临时下调上传并发到 ${targetConcurrency}/${parallelism} 路' in html
+
+
 
 def test_multipart_flow_supports_resume_and_complete(tmp_path):
     client, fake_storage = make_client(tmp_path)

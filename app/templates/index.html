@@ -176,6 +176,8 @@
   const PART_RETRY_BASE_DELAY_MS = 800;
   const PART_RETRY_MAX_DELAY_MS = 5000;
   const PART_RETRY_AFTER_MAX_DELAY_MS = 15000;
+  const THROTTLE_CONCURRENCY_FLOOR = 1;
+  const THROTTLE_STREAK_REDUCE_THRESHOLD = 2;
 
   const activeControllers = new Set();
   let currentUploadId = null;
@@ -510,6 +512,10 @@
     const doneParts = new Set(init.uploaded_parts || []);
     const partLoaded = new Map();
     let loadedBase = 0;
+    let targetConcurrency = parallelism;
+    let activeWorkers = 0;
+    let throttle429Streak = 0;
+    let throttledNoticeShown = false;
     if (doneParts.size > 0) {
       for (const partNum of doneParts) {
         const start = (partNum - 1) * chunkSize;
@@ -517,10 +523,44 @@
       }
     }
 
+    const currentStrategyLabel = () => {
+      if (targetConcurrency < parallelism) {
+        return `策略：OCI multipart 分片并发上传（限流收敛至 ${targetConcurrency}/${parallelism} 路）`;
+      }
+      return '策略：OCI multipart 分片并发上传';
+    };
+
     const updateAggregateProgress = () => {
       let inflightLoaded = 0;
       for (const value of partLoaded.values()) inflightLoaded += value;
-      updateProgress({loaded: loadedBase + inflightLoaded, total: file.size, strategy: 'OCI multipart 分片并发上传'});
+      updateProgress({loaded: loadedBase + inflightLoaded, total: file.size, strategy: currentStrategyLabel().replace('策略：', '')});
+      strategyEl.textContent = currentStrategyLabel();
+    };
+
+    const noteConcurrencyReduction = (reason) => {
+      throttledNoticeShown = true;
+      detailEl.textContent = `检测到连续限流，已临时下调上传并发到 ${targetConcurrency}/${parallelism} 路；${reason}`;
+      etaEl.textContent = 'ETA 已按降并发重新估算';
+      strategyEl.textContent = currentStrategyLabel();
+    };
+
+    const maybeReduceConcurrency = ({retryAfterSeconds = null} = {}) => {
+      throttle429Streak += 1;
+      if (throttle429Streak < THROTTLE_STREAK_REDUCE_THRESHOLD) return false;
+      if (targetConcurrency <= THROTTLE_CONCURRENCY_FLOOR) return false;
+      targetConcurrency -= 1;
+      throttle429Streak = 0;
+      const waitHint = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+        ? `当前遵循服务端建议等待约 ${retryAfterSeconds} 秒`
+        : '当前继续保守退避重试';
+      noteConcurrencyReduction(waitHint);
+      return true;
+    };
+
+    const noteThrottleRecovered = () => {
+      if (!throttledNoticeShown || targetConcurrency >= parallelism) return;
+      detailEl.textContent = `限流趋稳，当前并发已收敛到 ${targetConcurrency}/${parallelism} 路并继续上传`;
+      etaEl.textContent = 'ETA 持续更新中';
     };
 
     updateAggregateProgress();
@@ -610,7 +650,10 @@
       while (attempt < MAX_PART_RETRIES) {
         attempt += 1;
         try {
-          return await uploadOnePartOnce(partNum);
+          const result = await uploadOnePartOnce(partNum);
+          throttle429Streak = 0;
+          noteThrottleRecovered();
+          return result;
         } catch (error) {
           if (currentAbort) throw error;
           const info = normalizePartUploadError(partNum, error);
@@ -628,10 +671,18 @@
           const waitHint = info.errorCode === 'http_429' && Number.isFinite(info.retryAfterSeconds) && info.retryAfterSeconds > 0
             ? `，遵循服务端建议等待约 ${info.retryAfterSeconds} 秒`
             : '';
-          detailEl.textContent = `分片 ${partNum} 失败：${errorLabel}；${Math.ceil(delayMs / 1000)} 秒后重试第 ${nextAttempt}/${MAX_PART_RETRIES} 次${waitHint}`;
+          if (info.errorCode === 'http_429') {
+            maybeReduceConcurrency({retryAfterSeconds: info.retryAfterSeconds});
+          } else {
+            throttle429Streak = 0;
+          }
+          const concurrencyHint = info.errorCode === 'http_429' && targetConcurrency < parallelism
+            ? `；当前并发已收敛到 ${targetConcurrency}/${parallelism} 路`
+            : '';
+          detailEl.textContent = `分片 ${partNum} 失败：${errorLabel}；${Math.ceil(delayMs / 1000)} 秒后重试第 ${nextAttempt}/${MAX_PART_RETRIES} 次${waitHint}${concurrencyHint}`;
           strategyEl.textContent = info.errorCode === 'http_429'
-            ? '策略：OCI multipart 分片并发上传（限流退避中）'
-            : '策略：OCI multipart 分片并发上传';
+            ? currentStrategyLabel().replace('）', '，限流退避中）')
+            : currentStrategyLabel();
           etaEl.textContent = `ETA 重试等待 ${fmtDuration(delayMs / 1000)}`;
           await sleep(delayMs);
         }
@@ -639,14 +690,22 @@
       throw new Error(`分片 ${partNum} 上传失败`);
     };
 
-    const workers = Array.from({length: parallelism}, async () => {
-      while (partQueue.length > 0) {
-        if (currentAbort) throw new Error('上传已取消');
-        const partNum = partQueue.shift();
-        if (!partNum) return;
-        await uploadOnePart(partNum);
+    const workerLoop = async () => {
+      activeWorkers += 1;
+      try {
+        while (partQueue.length > 0) {
+          if (currentAbort) throw new Error('上传已取消');
+          if (activeWorkers > targetConcurrency) return;
+          const partNum = partQueue.shift();
+          if (!partNum) return;
+          await uploadOnePart(partNum);
+        }
+      } finally {
+        activeWorkers = Math.max(0, activeWorkers - 1);
       }
-    });
+    };
+
+    const workers = Array.from({length: parallelism}, () => workerLoop());
 
     await Promise.all(workers);
     strategyEl.textContent = '策略：OCI multipart 分片并发上传';
