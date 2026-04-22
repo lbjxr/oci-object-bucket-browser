@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
+import tempfile
+import zipfile
 from datetime import datetime
 from io import BytesIO
 from urllib.parse import quote
 
-from fastapi import APIRouter, Body, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import APIRouter, Body, File, Form, HTTPException, Request, Response, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
@@ -22,7 +25,7 @@ templates = Jinja2Templates(directory="app/templates")
 
 
 def build_upload_error_payload(*, part_num: int, exc: OCIStorageError) -> dict[str, object]:
-    return {
+    payload = {
         "ok": False,
         "part_num": part_num,
         "detail": str(exc),
@@ -30,6 +33,9 @@ def build_upload_error_payload(*, part_num: int, exc: OCIStorageError) -> dict[s
         "retryable": exc.retryable,
         "reason": exc.reason,
     }
+    if exc.retry_after_seconds is not None:
+        payload["retry_after_seconds"] = exc.retry_after_seconds
+    return payload
 
 
 def format_size_display(size: int | None) -> str:
@@ -223,6 +229,93 @@ class UploadInitRequest(BaseModel):
 
 class BatchDeleteRequest(BaseModel):
     object_names: list[str]
+
+
+class BatchDownloadRequest(BaseModel):
+    object_names: list[str]
+
+
+class SingleRangeRequest(BaseModel):
+    start: int
+    end: int
+
+
+def _normalize_object_names(object_names: list[str]) -> list[str]:
+    normalized = []
+    seen = set()
+    for raw_name in object_names:
+        name = (raw_name or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        normalized.append(name)
+    return normalized
+
+
+def _build_batch_download_filename(prefix: str, object_count: int) -> str:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    prefix_label = (prefix or "").strip().strip("/")
+    if prefix_label:
+        prefix_label = prefix_label.replace("/", "-").replace(" ", "-")[:48]
+        return f"oci-batch-{prefix_label}-{object_count}items-{timestamp}.zip"
+    return f"oci-batch-{object_count}items-{timestamp}.zip"
+
+
+def _content_disposition_attachment(filename: str) -> str:
+    ascii_fallback = filename.encode("ascii", errors="ignore").decode("ascii") or "download.bin"
+    quoted = quote(filename)
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quoted}"
+
+
+def _parse_single_range_header(range_header: str | None, *, total_size: int) -> SingleRangeRequest | None:
+    if not range_header:
+        return None
+    value = range_header.strip()
+    if not value:
+        return None
+    if not value.startswith("bytes="):
+        raise HTTPException(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE, detail="仅支持 bytes Range")
+
+    ranges = [item.strip() for item in value[6:].split(",") if item.strip()]
+    if len(ranges) != 1:
+        raise HTTPException(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE, detail="当前仅支持单段 Range 请求")
+
+    raw_range = ranges[0]
+    if "-" not in raw_range:
+        raise HTTPException(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE, detail="非法的 Range 请求")
+    start_text, end_text = raw_range.split("-", 1)
+
+    if start_text == "":
+        if not end_text.isdigit():
+            raise HTTPException(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE, detail="非法的 Range 请求")
+        suffix_length = int(end_text)
+        if suffix_length <= 0:
+            raise HTTPException(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE, detail="非法的 Range 请求")
+        if total_size <= 0:
+            raise HTTPException(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE, detail="对象为空，无法执行 Range 下载")
+        start = max(total_size - suffix_length, 0)
+        end = total_size - 1
+        return SingleRangeRequest(start=start, end=end)
+
+    if not start_text.isdigit():
+        raise HTTPException(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE, detail="非法的 Range 请求")
+
+    start = int(start_text)
+    if start >= total_size:
+        raise HTTPException(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE, detail="Range 起点超出对象大小")
+
+    if end_text == "":
+        end = total_size - 1
+    else:
+        if not end_text.isdigit():
+            raise HTTPException(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE, detail="非法的 Range 请求")
+        end = int(end_text)
+
+    if end < start:
+        raise HTTPException(status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE, detail="Range 结束位置早于起点")
+
+    end = min(end, total_size - 1)
+    return SingleRangeRequest(start=start, end=end)
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -432,13 +525,14 @@ async def upload_part(request: Request, response: Response, upload_id: str, part
         response.status_code = exc.status_code
         return build_upload_error_payload(part_num=part_num, exc=exc)
     except Exception as exc:
-        category, retryable, status_code, reason = classify_upload_exception(exc)
+        category, retryable, status_code, reason, retry_after_seconds = classify_upload_exception(exc)
         wrapped = OCIStorageError(
             f"上传分片失败（part {part_num}，{'可重试' if retryable else '不可重试'}，{category}）: {reason}",
             category=category,
             retryable=retryable,
             status_code=status_code,
             reason=reason,
+            retry_after_seconds=retry_after_seconds,
         )
         response.status_code = wrapped.status_code
         return build_upload_error_payload(part_num=part_num, exc=wrapped)
@@ -554,12 +648,127 @@ async def cancel_upload(request: Request, upload_id: str):
 def download(request: Request, object_name: str):
     if not request.session.get("authenticated"):
         return redirect_to_login(request.url.path)
+
+    storage = get_storage()
+    filename = object_name.split("/")[-1] or "download.bin"
+
     try:
-        stream, content_type = get_storage().open_stream(object_name)
-        headers = {"Content-Disposition": f'attachment; filename="{object_name.split("/")[-1]}"'}
-        return StreamingResponse(stream, media_type=content_type, headers=headers)
+        object_info = storage.head_object(object_name)
     except OCIStorageError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    total_size = object_info.size or 0
+    requested_range = _parse_single_range_header(request.headers.get("range"), total_size=total_size) if object_info.size is not None else None
+    range_header = None
+    response_headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": _content_disposition_attachment(filename),
+    }
+    status_code = status.HTTP_200_OK
+
+    if object_info.etag:
+        response_headers["ETag"] = object_info.etag
+
+    if requested_range is not None:
+        range_header = f"bytes={requested_range.start}-{requested_range.end}"
+        response_headers["Content-Range"] = f"bytes {requested_range.start}-{requested_range.end}/{total_size}"
+        response_headers["Content-Length"] = str(requested_range.end - requested_range.start + 1)
+        status_code = status.HTTP_206_PARTIAL_CONTENT
+    elif object_info.size is not None:
+        response_headers["Content-Length"] = str(object_info.size)
+
+    try:
+        stream, content_type, upstream_headers = storage.open_stream(object_name, range_header=range_header)
+    except OCIStorageError as exc:
+        detail = str(exc)
+        if requested_range is not None and ("Range Not Satisfiable" in detail or "range" in detail.lower()):
+            raise HTTPException(
+                status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+                detail=detail,
+                headers={"Content-Range": f"bytes */{total_size}"},
+            ) from exc
+        raise HTTPException(status_code=404, detail=detail) from exc
+
+    if status_code == status.HTTP_200_OK:
+        upstream_length = upstream_headers.get("content-length")
+        if upstream_length:
+            response_headers["Content-Length"] = upstream_length
+    if object_info.size is not None and "Content-Range" not in response_headers:
+        response_headers.setdefault("Content-Range", f"bytes 0-{max(total_size - 1, 0)}/{total_size}")
+
+    return StreamingResponse(stream, media_type=content_type, headers=response_headers, status_code=status_code)
+
+
+@router.post("/objects/batch-download")
+def batch_download_objects(request: Request, payload: BatchDownloadRequest = Body(...), prefix: str = ""):
+    if not request.session.get("authenticated"):
+        return JSONResponse({"detail": "未登录"}, status_code=401)
+
+    object_names = _normalize_object_names(payload.object_names)
+    if not object_names:
+        raise HTTPException(status_code=400, detail="至少要选择一个对象")
+
+    storage = get_storage()
+    temp_file = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    failed: list[dict[str, str]] = []
+    archived_count = 0
+    try:
+        with zipfile.ZipFile(temp_file, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+            manifest = {
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "requested_count": len(object_names),
+                "archived_count": 0,
+                "failed_count": 0,
+                "failed": failed,
+            }
+            for object_name in object_names:
+                try:
+                    stream, _content_type, _headers = storage.open_stream(object_name)
+                except OCIStorageError as exc:
+                    failed.append({"object_name": object_name, "detail": str(exc)})
+                    continue
+                except Exception as exc:
+                    failed.append({"object_name": object_name, "detail": f"异常信息：{exc}"})
+                    continue
+
+                with stream:
+                    archive.writestr(object_name, stream.read())
+                    archived_count += 1
+
+            manifest["archived_count"] = archived_count
+            manifest["failed_count"] = len(failed)
+            if failed:
+                archive.writestr(
+                    "_batch_download_failures.json",
+                    json.dumps(manifest, ensure_ascii=False, indent=2),
+                )
+                failure_lines = [
+                    "以下对象未能打进本次 ZIP，其他成功对象已正常导出：",
+                    "",
+                ]
+                for item in failed:
+                    failure_lines.append(f"- {item['object_name']}: {item['detail']}")
+                archive.writestr("_batch_download_failures.txt", "\n".join(failure_lines))
+
+        if archived_count == 0:
+            raise HTTPException(status_code=500, detail="批量下载失败：所有对象都未能成功读取，未生成可用 ZIP。")
+
+        temp_file.seek(0)
+        filename = _build_batch_download_filename(prefix=prefix, object_count=len(object_names))
+        headers = {
+            "Content-Disposition": _content_disposition_attachment(filename),
+            "X-Batch-Requested-Count": str(len(object_names)),
+            "X-Batch-Archived-Count": str(archived_count),
+            "X-Batch-Failed-Count": str(len(failed)),
+            "X-Batch-Partial": "1" if failed else "0",
+        }
+        return StreamingResponse(temp_file, media_type="application/zip", headers=headers)
+    except HTTPException:
+        temp_file.close()
+        raise
+    except Exception as exc:
+        temp_file.close()
+        raise HTTPException(status_code=500, detail=f"批量下载打包失败：{exc}") from exc
 
 
 @router.post("/objects/batch-delete")
@@ -567,14 +776,7 @@ def batch_delete_objects(request: Request, payload: BatchDeleteRequest = Body(..
     if not request.session.get("authenticated"):
         return JSONResponse({"detail": "未登录"}, status_code=401)
 
-    object_names = []
-    seen = set()
-    for raw_name in payload.object_names:
-        name = (raw_name or "").strip()
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        object_names.append(name)
+    object_names = _normalize_object_names(payload.object_names)
 
     if not object_names:
         raise HTTPException(status_code=400, detail="至少要选择一个对象")

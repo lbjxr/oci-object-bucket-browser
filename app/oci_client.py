@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from io import BytesIO
 from typing import BinaryIO
 import socket
@@ -15,7 +17,7 @@ from oci.object_storage.models import (
 )
 
 from app.config import Settings, get_settings
-from app.models import ObjectEntry, PreviewData
+from app.models import ObjectDownloadInfo, ObjectEntry, PreviewData
 from app.utils import guess_content_type, is_image_type, is_pdf_type, is_text_type
 
 
@@ -28,31 +30,65 @@ class OCIStorageError(RuntimeError):
         retryable: bool = False,
         status_code: int = 500,
         reason: str | None = None,
+        retry_after_seconds: int | None = None,
     ) -> None:
         super().__init__(message)
         self.category = category
         self.retryable = retryable
         self.status_code = status_code
         self.reason = reason or message
+        self.retry_after_seconds = retry_after_seconds
 
 
-def classify_upload_exception(exc: Exception) -> tuple[str, bool, int, str]:
+def _coerce_retry_after_seconds(value: object) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        seconds = int(text)
+        return seconds if seconds > 0 else None
+    try:
+        target = parsedate_to_datetime(text)
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        seconds = int((target - now).total_seconds())
+        return seconds if seconds > 0 else None
+    except Exception:
+        return None
+
+
+def extract_retry_after_seconds(exc: ServiceError) -> int | None:
+    headers = getattr(exc, "headers", {}) or {}
+    for header_name in ("retry-after", "Retry-After", "opc-retry-after", "Opc-Retry-After"):
+        if header_name in headers:
+            seconds = _coerce_retry_after_seconds(headers.get(header_name))
+            if seconds is not None:
+                return seconds
+    return None
+
+
+def classify_upload_exception(exc: Exception) -> tuple[str, bool, int, str, int | None]:
     if isinstance(exc, ServiceError):
         status = int(getattr(exc, "status", 500) or 500)
         code = (getattr(exc, "code", "") or "").strip()
         message = (getattr(exc, "message", "") or str(exc)).strip() or "OCI 服务返回异常"
+        retry_after_seconds = extract_retry_after_seconds(exc)
         if 500 <= status <= 599:
-            return "http_5xx", True, 503, f"OCI 服务暂时不可用（HTTP {status}{f', {code}' if code else ''}）: {message}"
+            return "http_5xx", True, 503, f"OCI 服务暂时不可用（HTTP {status}{f', {code}' if code else ''}）: {message}", retry_after_seconds
         if status == 408:
-            return "timeout", True, 504, f"OCI 服务处理超时（HTTP 408）: {message}"
+            return "timeout", True, 504, f"OCI 服务处理超时（HTTP 408）: {message}", retry_after_seconds
         if status == 429:
-            return "http_4xx", True, 429, f"OCI 服务限流（HTTP 429）: {message}"
+            wait_hint = f"，建议等待约 {retry_after_seconds} 秒后再试" if retry_after_seconds else ""
+            return "http_429", True, 429, f"OCI 服务限流（HTTP 429）: {message}{wait_hint}", retry_after_seconds
         if 400 <= status <= 499:
-            return "http_4xx", False, status, f"OCI 服务拒绝该分片请求（HTTP {status}{f', {code}' if code else ''}）: {message}"
-        return "unknown", False, 500, message
+            return "http_4xx", False, status, f"OCI 服务拒绝该分片请求（HTTP {status}{f', {code}' if code else ''}）: {message}", retry_after_seconds
+        return "unknown", False, 500, message, retry_after_seconds
 
     if isinstance(exc, TimeoutError) or isinstance(exc, socket.timeout):
-        return "timeout", True, 504, "上传分片到 OCI 超时"
+        return "timeout", True, 504, "上传分片到 OCI 超时", None
 
     lowered = str(exc).lower()
     connection_keywords = (
@@ -69,9 +105,9 @@ def classify_upload_exception(exc: Exception) -> tuple[str, bool, int, str]:
         "econnrefused",
     )
     if any(keyword in lowered for keyword in connection_keywords):
-        return "connection", True, 503, f"上传分片到 OCI 时连接中断: {exc}"
+        return "connection", True, 503, f"上传分片到 OCI 时连接中断: {exc}", None
 
-    return "unknown", False, 500, f"上传分片失败: {exc}"
+    return "unknown", False, 500, f"上传分片失败: {exc}", None
 
 
 class OCIStorageService:
@@ -180,7 +216,7 @@ class OCIStorageService:
         except OCIStorageError:
             raise
         except Exception as exc:
-            category, retryable, status_code, reason = classify_upload_exception(exc)
+            category, retryable, status_code, reason, retry_after_seconds = classify_upload_exception(exc)
             retry_hint = "可重试" if retryable else "不可重试"
             raise OCIStorageError(
                 f"上传分片失败（part {part_num}，{retry_hint}，{category}）: {reason}",
@@ -188,6 +224,7 @@ class OCIStorageService:
                 retryable=retryable,
                 status_code=status_code,
                 reason=reason,
+                retry_after_seconds=retry_after_seconds,
             ) from exc
 
     def list_multipart_uploaded_parts(self, *, object_name: str, multipart_upload_id: str) -> dict[int, str]:
@@ -252,9 +289,12 @@ class OCIStorageService:
         except ServiceError as exc:
             raise OCIStorageError(f"删除失败: {exc.message}") from exc
 
-    def get_object(self, object_name: str):
+    def get_object(self, object_name: str, *, range_header: str | None = None):
         try:
-            return self.client.get_object(self.namespace, self.bucket_name, object_name)
+            kwargs = {}
+            if range_header:
+                kwargs["range"] = range_header
+            return self.client.get_object(self.namespace, self.bucket_name, object_name, **kwargs)
         except ServiceError as exc:
             raise OCIStorageError(f"下载失败: {exc.message}") from exc
 
@@ -272,10 +312,29 @@ class OCIStorageService:
             return PreviewData(kind="pdf", content_type=content_type, bytes_data=payload)
         return PreviewData(kind="download", content_type=content_type, download_only=True)
 
-    def open_stream(self, object_name: str) -> tuple[BytesIO, str]:
-        response = self.get_object(object_name)
+    def head_object(self, object_name: str) -> ObjectDownloadInfo:
+        try:
+            response = self.client.head_object(self.namespace, self.bucket_name, object_name)
+        except ServiceError as exc:
+            raise OCIStorageError(f"获取对象信息失败: {exc.message}") from exc
+        size_header = response.headers.get("content-length")
+        size = int(size_header) if size_header and str(size_header).isdigit() else None
         content_type = guess_content_type(object_name, response.headers.get("content-type"))
-        return BytesIO(response.data.content), content_type
+        return ObjectDownloadInfo(
+            size=size,
+            etag=response.headers.get("etag"),
+            content_type=content_type,
+        )
+
+    def open_stream(self, object_name: str, *, range_header: str | None = None) -> tuple[BytesIO, str, dict[str, str]]:
+        response = self.get_object(object_name, range_header=range_header)
+        content_type = guess_content_type(object_name, response.headers.get("content-type"))
+        headers: dict[str, str] = {}
+        for header_name in ("content-length", "content-range", "etag", "last-modified"):
+            header_value = response.headers.get(header_name)
+            if header_value:
+                headers[header_name] = str(header_value)
+        return BytesIO(response.data.content), content_type, headers
 
 
-__all__ = ["OCIStorageService", "OCIStorageError", "classify_upload_exception"]
+__all__ = ["OCIStorageService", "OCIStorageError", "classify_upload_exception", "extract_retry_after_seconds"]

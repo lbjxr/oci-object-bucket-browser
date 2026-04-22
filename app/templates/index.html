@@ -74,6 +74,7 @@
         <span id="batch-delete-selection" class="batch-delete-selection">已选 0 项</span>
         <button id="batch-delete-select-all" class="toolbar-link" type="button">全选当前结果</button>
         <button id="batch-delete-clear" class="toolbar-link" type="button" disabled>清空选择</button>
+        <button id="batch-download-button" class="toolbar-link" type="button" disabled>下载所选</button>
         <button id="batch-delete-button" class="toolbar-link toolbar-link-danger" type="button" disabled>批量删除</button>
       </div>
       {% endif %}
@@ -152,6 +153,7 @@
   const batchDeleteToolbar = document.getElementById('batch-delete-toolbar');
   const batchDeleteSelection = document.getElementById('batch-delete-selection');
   const batchDeleteButton = document.getElementById('batch-delete-button');
+  const batchDownloadButton = document.getElementById('batch-download-button');
   const batchDeleteSelectAll = document.getElementById('batch-delete-select-all');
   const batchDeleteClear = document.getElementById('batch-delete-clear');
   const form = document.getElementById('upload-form');
@@ -175,6 +177,9 @@
   const MAX_PART_RETRIES = 4;
   const PART_RETRY_BASE_DELAY_MS = 800;
   const PART_RETRY_MAX_DELAY_MS = 5000;
+  const PART_RETRY_AFTER_MAX_DELAY_MS = 15000;
+  const THROTTLE_CONCURRENCY_FLOOR = 1;
+  const THROTTLE_STREAK_REDUCE_THRESHOLD = 2;
 
   const activeControllers = new Set();
   let currentUploadId = null;
@@ -306,6 +311,7 @@
     const count = selected.length;
     batchDeleteSelection.textContent = `已选 ${count} 项`;
     batchDeleteButton.disabled = count === 0;
+    if (batchDownloadButton) batchDownloadButton.disabled = count === 0;
     if (batchDeleteClear) batchDeleteClear.disabled = count === 0;
     if (batchDeleteSelectAll) batchDeleteSelectAll.disabled = enabledCount === 0 || count === enabledCount;
     batchDeleteToolbar.classList.toggle('hidden', boxes.length === 0);
@@ -443,27 +449,35 @@
     const errorCode = payload && payload.error_code ? payload.error_code : 'unknown';
     const retryable = typeof (payload && payload.retryable) === 'boolean'
       ? payload.retryable
-      : ['timeout', 'connection', 'http_5xx'].includes(errorCode);
+      : ['timeout', 'connection', 'http_5xx', 'http_429'].includes(errorCode);
     const reason = payload && payload.reason
       ? payload.reason
       : (error && error.message ? error.message : `分片 ${partNum} 上传失败`);
+    let retryAfterSeconds = null;
+    if (payload && Number.isFinite(Number(payload.retry_after_seconds))) {
+      retryAfterSeconds = Math.max(0, Math.round(Number(payload.retry_after_seconds)));
+    }
     return {
       errorCode,
       retryable,
       reason,
+      retryAfterSeconds,
       message: payload && payload.detail ? payload.detail : reason,
     };
   };
 
-  const retryDelayFor = (errorCode, attempt) => {
+  const retryDelayFor = (errorCode, attempt, retryAfterSeconds = null) => {
     const jitter = Math.floor(Math.random() * 250);
+    if (errorCode === 'http_429' && Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+      return Math.min(PART_RETRY_AFTER_MAX_DELAY_MS, retryAfterSeconds * 1000 + jitter);
+    }
     if (errorCode === 'timeout') {
       return Math.min(PART_RETRY_MAX_DELAY_MS, 1200 * attempt + jitter);
     }
     if (errorCode === 'connection') {
       return Math.min(PART_RETRY_MAX_DELAY_MS, 900 * attempt + jitter);
     }
-    if (errorCode === 'http_5xx') {
+    if (errorCode === 'http_5xx' || errorCode === 'http_429') {
       return Math.min(PART_RETRY_MAX_DELAY_MS, PART_RETRY_BASE_DELAY_MS * (2 ** (attempt - 1)) + jitter);
     }
     return Math.min(PART_RETRY_MAX_DELAY_MS, PART_RETRY_BASE_DELAY_MS * attempt + jitter);
@@ -473,6 +487,7 @@
     if (errorCode === 'timeout') return '请求超时';
     if (errorCode === 'connection') return '连接中断';
     if (errorCode === 'http_5xx') return '服务端 5xx';
+    if (errorCode === 'http_429') return 'OCI 限流 429';
     if (errorCode === 'http_4xx') return '请求被拒绝/4xx';
     return '未知错误';
   };
@@ -500,6 +515,10 @@
     const doneParts = new Set(init.uploaded_parts || []);
     const partLoaded = new Map();
     let loadedBase = 0;
+    let targetConcurrency = parallelism;
+    let activeWorkers = 0;
+    let throttle429Streak = 0;
+    let throttledNoticeShown = false;
     if (doneParts.size > 0) {
       for (const partNum of doneParts) {
         const start = (partNum - 1) * chunkSize;
@@ -507,10 +526,44 @@
       }
     }
 
+    const currentStrategyLabel = () => {
+      if (targetConcurrency < parallelism) {
+        return `策略：OCI multipart 分片并发上传（限流收敛至 ${targetConcurrency}/${parallelism} 路）`;
+      }
+      return '策略：OCI multipart 分片并发上传';
+    };
+
     const updateAggregateProgress = () => {
       let inflightLoaded = 0;
       for (const value of partLoaded.values()) inflightLoaded += value;
-      updateProgress({loaded: loadedBase + inflightLoaded, total: file.size, strategy: 'OCI multipart 分片并发上传'});
+      updateProgress({loaded: loadedBase + inflightLoaded, total: file.size, strategy: currentStrategyLabel().replace('策略：', '')});
+      strategyEl.textContent = currentStrategyLabel();
+    };
+
+    const noteConcurrencyReduction = (reason) => {
+      throttledNoticeShown = true;
+      detailEl.textContent = `检测到连续限流，已临时下调上传并发到 ${targetConcurrency}/${parallelism} 路；${reason}`;
+      etaEl.textContent = 'ETA 已按降并发重新估算';
+      strategyEl.textContent = currentStrategyLabel();
+    };
+
+    const maybeReduceConcurrency = ({retryAfterSeconds = null} = {}) => {
+      throttle429Streak += 1;
+      if (throttle429Streak < THROTTLE_STREAK_REDUCE_THRESHOLD) return false;
+      if (targetConcurrency <= THROTTLE_CONCURRENCY_FLOOR) return false;
+      targetConcurrency -= 1;
+      throttle429Streak = 0;
+      const waitHint = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+        ? `当前遵循服务端建议等待约 ${retryAfterSeconds} 秒`
+        : '当前继续保守退避重试';
+      noteConcurrencyReduction(waitHint);
+      return true;
+    };
+
+    const noteThrottleRecovered = () => {
+      if (!throttledNoticeShown || targetConcurrency >= parallelism) return;
+      detailEl.textContent = `限流趋稳，当前并发已收敛到 ${targetConcurrency}/${parallelism} 路并继续上传`;
+      etaEl.textContent = 'ETA 持续更新中';
     };
 
     updateAggregateProgress();
@@ -600,7 +653,10 @@
       while (attempt < MAX_PART_RETRIES) {
         attempt += 1;
         try {
-          return await uploadOnePartOnce(partNum);
+          const result = await uploadOnePartOnce(partNum);
+          throttle429Streak = 0;
+          noteThrottleRecovered();
+          return result;
         } catch (error) {
           if (currentAbort) throw error;
           const info = normalizePartUploadError(partNum, error);
@@ -614,8 +670,22 @@
             throw new Error(`分片 ${partNum} 上传失败：${info.reason}（${errorLabel}，已重试 ${attempt} 次后停止）`);
           }
           const nextAttempt = attempt + 1;
-          const delayMs = retryDelayFor(info.errorCode, attempt);
-          detailEl.textContent = `分片 ${partNum} 失败：${errorLabel}；${Math.ceil(delayMs / 1000)} 秒后重试第 ${nextAttempt}/${MAX_PART_RETRIES} 次`;
+          const delayMs = retryDelayFor(info.errorCode, attempt, info.retryAfterSeconds);
+          const waitHint = info.errorCode === 'http_429' && Number.isFinite(info.retryAfterSeconds) && info.retryAfterSeconds > 0
+            ? `，遵循服务端建议等待约 ${info.retryAfterSeconds} 秒`
+            : '';
+          if (info.errorCode === 'http_429') {
+            maybeReduceConcurrency({retryAfterSeconds: info.retryAfterSeconds});
+          } else {
+            throttle429Streak = 0;
+          }
+          const concurrencyHint = info.errorCode === 'http_429' && targetConcurrency < parallelism
+            ? `；当前并发已收敛到 ${targetConcurrency}/${parallelism} 路`
+            : '';
+          detailEl.textContent = `分片 ${partNum} 失败：${errorLabel}；${Math.ceil(delayMs / 1000)} 秒后重试第 ${nextAttempt}/${MAX_PART_RETRIES} 次${waitHint}${concurrencyHint}`;
+          strategyEl.textContent = info.errorCode === 'http_429'
+            ? currentStrategyLabel().replace('）', '，限流退避中）')
+            : currentStrategyLabel();
           etaEl.textContent = `ETA 重试等待 ${fmtDuration(delayMs / 1000)}`;
           await sleep(delayMs);
         }
@@ -623,16 +693,25 @@
       throw new Error(`分片 ${partNum} 上传失败`);
     };
 
-    const workers = Array.from({length: parallelism}, async () => {
-      while (partQueue.length > 0) {
-        if (currentAbort) throw new Error('上传已取消');
-        const partNum = partQueue.shift();
-        if (!partNum) return;
-        await uploadOnePart(partNum);
+    const workerLoop = async () => {
+      activeWorkers += 1;
+      try {
+        while (partQueue.length > 0) {
+          if (currentAbort) throw new Error('上传已取消');
+          if (activeWorkers > targetConcurrency) return;
+          const partNum = partQueue.shift();
+          if (!partNum) return;
+          await uploadOnePart(partNum);
+        }
+      } finally {
+        activeWorkers = Math.max(0, activeWorkers - 1);
       }
-    });
+    };
+
+    const workers = Array.from({length: parallelism}, () => workerLoop());
 
     await Promise.all(workers);
+    strategyEl.textContent = '策略：OCI multipart 分片并发上传';
     detailEl.textContent = '分片上传完成，正在合并...';
     const completed = await jsonFetch(`/api/uploads/${encodeURIComponent(currentUploadId)}/complete`, {
       method: 'POST',
@@ -677,6 +756,57 @@
     syncBatchDeleteToolbar();
   };
 
+  const triggerBatchDownload = async () => {
+    const selected = getSelectedObjectNames();
+    if (selected.length === 0) return;
+
+    hideSuccess();
+    hideDeleteFeedback();
+    const originText = batchDownloadButton.textContent;
+    batchDownloadButton.disabled = true;
+    batchDeleteButton.disabled = true;
+    if (batchDeleteClear) batchDeleteClear.disabled = true;
+    batchDownloadButton.textContent = '打包中...';
+
+    try {
+      const currentPrefix = objectList?.dataset.currentPrefix || '';
+      const response = await fetch(`/objects/batch-download?prefix=${encodeURIComponent(currentPrefix)}`, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({object_names: selected}),
+      });
+
+      if (!response.ok) {
+        const contentType = response.headers.get('content-type') || '';
+        if (contentType.includes('application/json')) {
+          const payload = await response.json();
+          throw new Error(payload.detail || payload.message || `HTTP ${response.status}`);
+        }
+        throw new Error(await response.text() || `HTTP ${response.status}`);
+      }
+
+      const blob = await response.blob();
+      const disposition = response.headers.get('content-disposition') || '';
+      const filenameMatch = disposition.match(/filename="([^"]+)"/i);
+      const filename = filenameMatch ? filenameMatch[1] : `oci-batch-${selected.length}.zip`;
+      const objectUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = objectUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => window.URL.revokeObjectURL(objectUrl), 1000);
+      showDeleteFeedback(`✅ 已开始下载打包文件：${filename}`, 'success');
+    } catch (error) {
+      showDeleteFeedback(`批量下载失败：${error.message || error}`, 'error');
+    } finally {
+      batchDownloadButton.textContent = originText;
+      syncBatchDeleteToolbar();
+    }
+  };
+
   const handleBatchDelete = async () => {
     const selected = getSelectedObjectNames();
     if (selected.length === 0) return;
@@ -686,6 +816,7 @@
     hideSuccess();
     hideDeleteFeedback();
     batchDeleteButton.disabled = true;
+    if (batchDownloadButton) batchDownloadButton.disabled = true;
     batchDeleteClear.disabled = true;
     const originBatchText = batchDeleteButton.textContent;
     batchDeleteButton.textContent = '删除中...';
@@ -793,6 +924,10 @@
       hideDeleteFeedback();
       syncBatchDeleteToolbar();
     });
+  }
+
+  if (batchDownloadButton) {
+    batchDownloadButton.addEventListener('click', triggerBatchDownload);
   }
 
   if (batchDeleteButton) {
