@@ -240,8 +240,16 @@ class OCIStorageService:
                     limit=1000,
                     page=page,
                 )
-                for item in response.data.parts:
-                    parts[int(item.part_num)] = item.etag
+                payload = response.data
+                items = payload.parts if hasattr(payload, "parts") else payload
+                for item in items or []:
+                    part_num = getattr(item, "part_num", None)
+                    if part_num is None:
+                        part_num = getattr(item, "part_number", None)
+                    etag = getattr(item, "etag", None)
+                    if part_num is None or not etag:
+                        continue
+                    parts[int(part_num)] = etag
                 page = response.headers.get("opc-next-page")
                 if not page:
                     break
