@@ -46,6 +46,7 @@
     </form>
   </section>
 
+
   <section class="card panel compact-panel form-panel">
     <div class="panel-header">
       <h2>前缀过滤</h2>
@@ -286,75 +287,6 @@
     renderBatchDeleteFeedback({message, type});
   };
 
-  const hideDeleteFeedback = () => {
-    deleteFeedbackBox.classList.add('hidden');
-    deleteFeedbackBox.innerHTML = '';
-  };
-
-  const getObjectRow = (objectName) => objectList ? objectList.querySelector(`[data-object-row][data-object-name="${CSS.escape(objectName)}"]`) : null;
-
-  const getSelectBoxes = () => objectList ? Array.from(objectList.querySelectorAll('.js-object-select')) : [];
-
-  const getSelectedObjectNames = () => getSelectBoxes().filter((input) => input.checked && !input.disabled).map((input) => input.value);
-
-  const updateObjectCount = () => {
-    if (!objectCountPill || !objectList) return;
-    const count = objectList.querySelectorAll('[data-object-row]').length;
-    objectCountPill.textContent = `共 ${count} 项`;
-  };
-
-  const ensureEmptyState = () => {
-    if (!objectList) return;
-    const remainingRows = objectList.querySelectorAll('[data-object-row]');
-    if (remainingRows.length > 0) return;
-    objectList.innerHTML = '<div class="empty-state">这里还没有对象，或者当前前缀下没有结果。</div>';
-  };
-
-  const syncBatchDeleteToolbar = () => {
-    if (!batchDeleteToolbar || !batchDeleteSelection || !batchDeleteButton) return;
-    const boxes = getSelectBoxes();
-    const selected = boxes.filter((input) => input.checked && !input.disabled);
-    const enabledCount = boxes.filter((input) => !input.disabled).length;
-    const count = selected.length;
-    batchDeleteSelection.textContent = `已选 ${count} 项`;
-    batchDeleteButton.disabled = count === 0;
-    if (batchDownloadButton) batchDownloadButton.disabled = count === 0;
-    if (batchDeleteClear) batchDeleteClear.disabled = count === 0;
-    if (batchDeleteSelectAll) batchDeleteSelectAll.disabled = enabledCount === 0 || count === enabledCount;
-    batchDeleteToolbar.classList.toggle('hidden', boxes.length === 0);
-  };
-
-  const resetSpeedSamples = () => {
-    speedSamples = [];
-  };
-
-  const computeSmoothedSpeed = (loaded) => {
-    const now = Date.now();
-    speedSamples.push({ ts: now, loaded });
-    const windowMs = 3000;
-    speedSamples = speedSamples.filter((sample) => now - sample.ts <= windowMs);
-    if (speedSamples.length < 2) return 0;
-    const first = speedSamples[0];
-    const last = speedSamples[speedSamples.length - 1];
-    const deltaBytes = Math.max(0, last.loaded - first.loaded);
-    const deltaSeconds = Math.max((last.ts - first.ts) / 1000, 0.001);
-    return deltaBytes / deltaSeconds;
-  };
-
-  const setIdle = () => {
-    submitBtn.disabled = false;
-    submitBtn.textContent = '上传到 Bucket';
-    cancelBtn.classList.add('hidden');
-    currentUploadId = null;
-    activeControllers.clear();
-    resetSpeedSamples();
-  };
-
-  const setBusy = () => {
-    submitBtn.disabled = true;
-    submitBtn.textContent = '上传中...';
-    cancelBtn.classList.remove('hidden');
-    resetSpeedSamples();
   };
 
   const updateProgress = ({ loaded, total, strategy }) => {
@@ -871,6 +803,10 @@
     hideSuccess();
   });
 
+      hideDirectFeedback();
+    });
+  }
+
   cancelBtn.addEventListener('click', async () => {
     currentAbort = true;
     for (const controller of Array.from(activeControllers)) {
@@ -962,6 +898,7 @@
       }
     });
   });
+
 
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
