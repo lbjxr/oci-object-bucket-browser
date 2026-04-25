@@ -24,6 +24,17 @@ class Settings:
     upload_single_put_threshold_mb: int = 32
     upload_parallelism: int = 6
     upload_session_dir: str = "./tmp/upload_sessions"
+    upload_task_dir: str = "./tmp/upload_tasks"
+    upload_temp_dir: str = "./tmp/upload_staging"
+    upload_proxy_chunk_size_mb: int = 8
+    upload_cleanup_enabled: bool = True
+    upload_cleanup_startup_enabled: bool = True
+    upload_cleanup_scheduler_enabled: bool = True
+    upload_cleanup_interval_seconds: int = 3600
+    upload_completed_task_visible_seconds: float = 1.0
+    upload_cleanup_completed_retention_hours: int = 24
+    upload_cleanup_failed_retention_hours: int = 72
+    upload_cleanup_stale_staging_retention_hours: int = 24
 
 
 @lru_cache(maxsize=1)
@@ -48,4 +59,15 @@ def get_settings() -> Settings:
         upload_single_put_threshold_mb=max(1, int(os.getenv("APP_UPLOAD_SINGLE_PUT_THRESHOLD_MB", "32"))),
         upload_parallelism=max(1, int(os.getenv("APP_UPLOAD_PARALLELISM", "6"))),
         upload_session_dir=os.getenv("APP_UPLOAD_SESSION_DIR", "./tmp/upload_sessions").strip() or "./tmp/upload_sessions",
+        upload_task_dir=os.getenv("APP_UPLOAD_TASK_DIR", "./tmp/upload_tasks").strip() or "./tmp/upload_tasks",
+        upload_temp_dir=os.getenv("APP_UPLOAD_TEMP_DIR", "./tmp/upload_staging").strip() or "./tmp/upload_staging",
+        upload_proxy_chunk_size_mb=max(1, int(os.getenv("APP_UPLOAD_PROXY_CHUNK_SIZE_MB", "8"))),
+        upload_cleanup_enabled=os.getenv("APP_UPLOAD_CLEANUP_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
+        upload_cleanup_startup_enabled=os.getenv("APP_UPLOAD_CLEANUP_STARTUP_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
+        upload_cleanup_scheduler_enabled=os.getenv("APP_UPLOAD_CLEANUP_SCHEDULER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
+        upload_cleanup_interval_seconds=max(1, int(os.getenv("APP_UPLOAD_CLEANUP_INTERVAL_SECONDS", "3600"))),
+        upload_completed_task_visible_seconds=max(0.0, float(os.getenv("APP_UPLOAD_COMPLETED_TASK_VISIBLE_SECONDS", "1.0"))),
+        upload_cleanup_completed_retention_hours=max(0, int(os.getenv("APP_UPLOAD_CLEANUP_COMPLETED_RETENTION_HOURS", "24"))),
+        upload_cleanup_failed_retention_hours=max(0, int(os.getenv("APP_UPLOAD_CLEANUP_FAILED_RETENTION_HOURS", "72"))),
+        upload_cleanup_stale_staging_retention_hours=max(1, int(os.getenv("APP_UPLOAD_CLEANUP_STALE_STAGING_RETENTION_HOURS", "24"))),
     )
