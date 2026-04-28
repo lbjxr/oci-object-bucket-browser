@@ -19,3 +19,10 @@ class PreviewData:
     text: str | None = None
     bytes_data: bytes | None = None
     download_only: bool = False
+
+
+@dataclass
+class ObjectDownloadInfo:
+    size: int | None
+    etag: str | None
+    content_type: str | None = None
