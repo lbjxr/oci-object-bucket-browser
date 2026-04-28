@@ -175,6 +175,56 @@ p {
   flex-wrap: wrap;
 }
 
+.file-manager-header-main {
+  display: grid;
+  gap: 10px;
+}
+
+.file-manager-breadcrumbs {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 0.92rem;
+}
+
+.breadcrumb-item {
+  display: inline-flex;
+  align-items: center;
+  min-height: 30px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background: rgba(227, 244, 255, 0.92);
+  border: 1px solid rgba(51, 166, 255, 0.14);
+  color: var(--primary-strong);
+  font-weight: 700;
+}
+
+.breadcrumb-item:hover {
+  text-decoration: none;
+  background: rgba(214, 239, 255, 1);
+}
+
+.breadcrumb-item.is-current {
+  background: linear-gradient(135deg, rgba(51, 166, 255, 0.14), rgba(255, 255, 255, 0.96));
+  border-color: rgba(51, 166, 255, 0.22);
+  color: var(--text);
+}
+
+.breadcrumb-separator {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.current-directory-note {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
 .batch-delete-toolbar {
   display: inline-flex;
   align-items: center;
@@ -354,6 +404,11 @@ p {
   border: 1px solid var(--line);
 }
 
+.button-inline {
+  width: auto;
+  min-width: 0;
+}
+
 .button-row,
 .topbar-actions,
 .action-links {
@@ -436,6 +491,10 @@ p {
 
 .object-row-shell-selectable {
   grid-template-columns: 30px minmax(0, 1fr) 68px;
+}
+
+.folder-row-shell {
+  grid-template-columns: minmax(0, 1fr) 68px;
 }
 
 .object-select-control {
@@ -559,6 +618,23 @@ p {
   padding-top: 8px;
   margin-top: 8px;
   border-top: 1px solid rgba(51, 166, 255, 0.10);
+  flex-wrap: wrap;
+}
+
+.folder-create-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.folder-create-row .input-text {
+  flex: 1 1 280px;
+}
+
+.batch-bar-shell {
+  margin-top: 16px;
 }
 
 .toolbar-link {
@@ -614,6 +690,47 @@ p {
   background: var(--primary-soft);
   color: var(--primary-strong);
   font-weight: 700;
+}
+
+.task-state-line {
+  gap: 8px;
+}
+
+.task-state-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 0.76rem;
+  font-weight: 700;
+  border: 1px solid transparent;
+}
+
+.task-state-pill-info {
+  background: rgba(227, 244, 255, 0.96);
+  color: var(--primary-strong);
+  border-color: rgba(51, 166, 255, 0.16);
+}
+
+.task-state-pill-warning {
+  background: rgba(255, 244, 214, 0.95);
+  color: #9a6700;
+  border-color: rgba(245, 158, 11, 0.2);
+}
+
+.task-state-pill-danger {
+  background: rgba(254, 226, 226, 0.95);
+  color: #b91c1c;
+  border-color: rgba(220, 38, 38, 0.16);
+}
+
+.task-retry-line {
+  color: #9a6700;
+}
+
+.task-error-text {
+  color: #b91c1c;
 }
 
 .alert {
@@ -785,6 +902,10 @@ img {
     justify-content: flex-start;
   }
 
+  .current-directory-note {
+    align-items: flex-start;
+  }
+
   .page-shell {
     padding: 18px 14px 28px;
   }
@@ -831,6 +952,21 @@ img {
     align-items: flex-start;
     flex-direction: column;
     gap: 8px;
+  }
+
+  .file-manager-breadcrumbs {
+    gap: 6px;
+  }
+
+  .breadcrumb-item {
+    min-height: 28px;
+    padding: 0 9px;
+    font-size: 0.86rem;
+  }
+
+  .current-directory-note {
+    gap: 8px;
+    font-size: 0.88rem;
   }
 
   .file-picker-button {

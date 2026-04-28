@@ -8,12 +8,13 @@
 {% endif %}
 
 <div id="upload-success" class="alert alert-success hidden" aria-live="polite"></div>
+<div id="conflict-feedback" class="alert alert-error hidden" aria-live="polite"></div>
 
 <div class="grid two-columns form-grid">
   <section class="card panel compact-panel form-panel">
     <div class="panel-header">
       <h2>上传文件</h2>
-      <p>小文件直传。大文件自动切成分片，并发传到 OCI multipart。</p>
+      <p>浏览器先把文件传到本服务；再由服务端异步上传到 OCI。大文件优先走服务端 multipart 并行上传。</p>
     </div>
     <form id="upload-form" action="/upload" method="post" enctype="multipart/form-data" class="stack-form">
       <label class="field-label" for="file">选择文件</label>
@@ -23,8 +24,9 @@
       </label>
       <input id="file" class="input-file visually-hidden-file" type="file" name="file" required>
       <div class="upload-strategy-note muted">
-        小于 {{ upload_single_put_threshold_mb }} MB 走单请求上传；更大的文件自动按 {{ upload_chunk_size_mb }} MB 分片，最多并发 {{ upload_parallelism }} 路。
+        浏览器到本站默认按 {{ upload_proxy_chunk_size_mb }} MB 分段暂存；服务端上传到桶时，小于 {{ upload_single_put_threshold_mb }} MB 走单请求，大文件按 {{ upload_chunk_size_mb }} MB 分片并行上传到 OCI，最多并发 {{ upload_parallelism }} 路。
       </div>
+      <div id="upload-resume-banner" class="alert alert-success hidden" aria-live="polite"></div>
       <div id="upload-status" class="upload-status hidden" aria-live="polite">
         <div class="upload-status-head">
           <span id="upload-percent">0%</span>
@@ -46,7 +48,6 @@
     </form>
   </section>
 
-
   <section class="card panel compact-panel form-panel">
     <div class="panel-header">
       <h2>前缀过滤</h2>
@@ -63,29 +64,88 @@
   </section>
 </div>
 
-<section class="card panel table-panel">
-  <div class="panel-header panel-header-inline panel-header-list-actions">
+<section class="card panel compact-panel form-panel">
+  <div class="panel-header panel-header-inline">
     <div>
-      <h2>对象列表</h2>
-      <p>{% if prefix %}当前前缀：<code>{{ prefix }}</code>{% else %}展示 bucket 当前可见对象{% endif %}</p>
+      <h2>上传任务</h2>
+      <p>这里显示最近的服务端上传任务与进度。</p>
+    </div>
+    <button id="refresh-upload-tasks" class="button button-secondary" type="button">刷新任务</button>
+  </div>
+  <div id="upload-task-list" class="object-list single-list">
+    <div class="empty-state">还没有上传任务。</div>
+  </div>
+</section>
+
+<section class="card panel compact-panel form-panel">
+  <div class="panel-header panel-header-inline panel-header-list-actions">
+    <div class="file-manager-header-main">
+      <h2>文件管理</h2>
+      <div id="file-manager-breadcrumbs" class="file-manager-breadcrumbs" aria-label="当前目录导航">
+        {% for crumb in breadcrumbs %}
+          {% if not loop.first %}
+          <span class="breadcrumb-separator" aria-hidden="true">/</span>
+          {% endif %}
+          {% if crumb.is_current %}
+          <span class="breadcrumb-item is-current">{{ crumb.name }}</span>
+          {% else %}
+          <a class="breadcrumb-item" href="/?prefix={{ crumb.prefix }}">{{ crumb.name }}</a>
+          {% endif %}
+        {% endfor %}
+      </div>
+      <div class="current-directory-note">
+        <span class="pill">当前目录</span>
+        <span id="current-directory-label"><code>{{ current_directory_label }}</code></span>
+        <span class="muted">上传 / 新建文件夹 / 重命名默认作用在这里。</span>
+      </div>
     </div>
     <div class="list-header-actions">
-      {% if objects %}
-      <div id="batch-delete-toolbar" class="batch-delete-toolbar" aria-live="polite">
-        <span id="batch-delete-selection" class="batch-delete-selection">已选 0 项</span>
-        <button id="batch-delete-select-all" class="toolbar-link" type="button">全选当前结果</button>
-        <button id="batch-delete-clear" class="toolbar-link" type="button" disabled>清空选择</button>
-        <button id="batch-download-button" class="toolbar-link" type="button" disabled>下载所选</button>
-        <button id="batch-delete-button" class="toolbar-link toolbar-link-danger" type="button" disabled>批量删除</button>
-      </div>
+      {% if parent_prefix or current_prefix %}
+      <a class="button button-secondary button-inline" href="/?prefix={{ parent_prefix }}">返回上级</a>
       {% endif %}
-      <span class="pill">共 {{ objects|length }} 项</span>
+      <button id="create-folder-button" class="button button-secondary button-inline" type="button">新建文件夹</button>
+      <button id="refresh-file-panel" class="button button-secondary button-inline" type="button">刷新列表</button>
+      <span id="file-manager-count" class="pill">共 {{ folders|length + objects|length }} 项</span>
     </div>
   </div>
 
-  <div id="object-list" class="object-list single-list" data-current-prefix="{{ prefix }}">
+  <div class="folder-create-row">
+    <input id="new-folder-name" class="input-text" type="text" placeholder="输入当前目录下的新文件夹名">
+    <button id="create-folder-submit" class="button button-inline" type="button">创建</button>
+  </div>
+
+  <div id="object-list" class="object-list single-list" data-current-prefix="{{ current_prefix }}">
+    {% for folder in folders %}
+    <article class="object-card object-card-unified object-row-card" data-object-row data-object-name="{{ folder.full_prefix }}" data-object-kind="folder">
+      <div class="object-row-shell folder-row-shell">
+        <div class="object-row-main">
+          <div class="object-main">
+            <div class="object-name">📁 {{ folder.name }}/</div>
+            <div class="object-subline">
+              <span>目录</span>
+              <span class="dot-sep">•</span>
+              <span>子项 {{ folder.item_count }}</span>
+              {% if folder.placeholder_exists %}
+              <span class="dot-sep">•</span>
+              <span>含目录占位对象</span>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+        <div class="object-thumb-wrap">
+          <div class="object-file-icon" aria-label="目录">📁</div>
+        </div>
+      </div>
+      <div class="object-toolbar">
+        <a class="toolbar-link" href="/?prefix={{ folder.full_prefix }}">打开</a>
+        <button class="toolbar-link js-rename-path" type="button" data-path="{{ folder.full_prefix }}" data-kind="folder" data-display-name="{{ folder.name }}">重命名</button>
+        <button class="toolbar-link toolbar-link-danger js-delete-path" type="button" data-path="{{ folder.full_prefix }}" data-kind="folder">删除目录</button>
+      </div>
+    </article>
+    {% endfor %}
+
     {% for obj in objects %}
-    <article class="object-card object-card-unified object-row-card" data-object-row data-object-name="{{ obj.name }}">
+    <article class="object-card object-card-unified object-row-card" data-object-row data-object-name="{{ obj.name }}" data-object-kind="file">
       <div class="object-row-shell object-row-shell-selectable">
         <label class="object-select-control" aria-label="选择 {{ obj.name }}">
           <input class="object-select-checkbox js-object-select" type="checkbox" value="{{ obj.name }}" data-object-name="{{ obj.name }}">
@@ -93,7 +153,7 @@
         </label>
         <div class="object-row-main">
           <div class="object-main">
-            <div class="object-name">{{ obj.name }}</div>
+            <div class="object-name">{{ obj.name.split('/')[-1] }}</div>
             <div class="object-subline">
               <span>{{ obj.file_type_label }}</span>
               {% if obj.content_type %}
@@ -105,6 +165,9 @@
               <span>创建于 {{ obj.time_display }}</span>
               {% endif %}
             </div>
+            {% if current_prefix and obj.name != obj.name.split('/')[-1] %}
+            <div class="object-subline"><span>完整路径：<code>{{ obj.name }}</code></span></div>
+            {% endif %}
           </div>
           <span class="object-size-badge">{{ obj.size_mb }}</span>
         </div>
@@ -119,12 +182,25 @@
       <div class="object-toolbar">
         <a class="toolbar-link" href="/view/{{ obj.name }}">预览</a>
         <a class="toolbar-link" href="/download/{{ obj.name }}">下载</a>
-        <button class="toolbar-link toolbar-link-danger js-delete-object" type="button" data-object-name="{{ obj.name }}">删除</button>
+        <button class="toolbar-link js-rename-path" type="button" data-path="{{ obj.name }}" data-kind="file" data-display-name="{{ obj.name.split('/')[-1] }}">重命名</button>
+        <button class="toolbar-link toolbar-link-danger js-delete-object js-delete-path" type="button" data-object-name="{{ obj.name }}" data-path="{{ obj.name }}" data-kind="file">删除</button>
       </div>
     </article>
-    {% else %}
-    <div class="empty-state">这里还没有对象，或者当前前缀下没有结果。</div>
     {% endfor %}
+
+    {% if not folders and not objects %}
+    <div class="empty-state">这里还没有对象，或者当前前缀下没有结果。</div>
+    {% endif %}
+  </div>
+
+  <div class="batch-bar-shell">
+    <div id="batch-delete-toolbar" class="batch-delete-toolbar{% if not objects %} hidden{% endif %}" aria-live="polite">
+      <span id="batch-delete-selection" class="batch-delete-selection">已选 0 项</span>
+      <button id="batch-delete-select-all" class="toolbar-link" type="button">全选当前结果</button>
+      <button id="batch-delete-clear" class="toolbar-link" type="button" disabled>清空选择</button>
+      <button id="batch-download-button" class="toolbar-link" type="button" disabled>下载所选</button>
+      <button id="batch-delete-button" class="toolbar-link toolbar-link-danger" type="button" disabled>批量删除</button>
+    </div>
   </div>
 </section>
 
@@ -153,9 +229,12 @@
 <script>
 (() => {
   const deleteButtons = Array.from(document.querySelectorAll('.js-delete-object'));
+  const renameButtons = Array.from(document.querySelectorAll('.js-rename-path'));
+  const deletePathButtons = Array.from(document.querySelectorAll('.js-delete-path'));
   const objectList = document.getElementById('object-list');
-  const objectCountPill = document.querySelector('.pill');
+  const objectCountPill = document.getElementById('file-manager-count');
   const deleteFeedbackBox = document.getElementById('object-delete-feedback');
+  const conflictFeedbackBox = document.getElementById('conflict-feedback');
   const batchDeleteToolbar = document.getElementById('batch-delete-toolbar');
   const batchDeleteSelection = document.getElementById('batch-delete-selection');
   const batchDeleteButton = document.getElementById('batch-delete-button');
@@ -164,14 +243,24 @@
   const batchDeleteClear = document.getElementById('batch-delete-clear');
   const batchDownloadForm = document.getElementById('batch-download-form');
   const batchDownloadHiddenInputs = document.getElementById('batch-download-hidden-inputs');
+  const taskList = document.getElementById('upload-task-list');
+  const refreshTaskBtn = document.getElementById('refresh-upload-tasks');
+  const refreshFilePanelBtn = document.getElementById('refresh-file-panel');
+  const createFolderButton = document.getElementById('create-folder-button');
+  const createFolderSubmit = document.getElementById('create-folder-submit');
+  const newFolderInput = document.getElementById('new-folder-name');
+  const breadcrumbBox = document.getElementById('file-manager-breadcrumbs');
+  const currentDirectoryLabel = document.getElementById('current-directory-label');
   const form = document.getElementById('upload-form');
   if (!form) return;
+
   const fileInput = document.getElementById('file');
   const filePickerHint = document.getElementById('file-picker-hint');
   const submitBtn = document.getElementById('upload-submit');
   const cancelBtn = document.getElementById('upload-cancel');
   const statusBox = document.getElementById('upload-status');
   const successBox = document.getElementById('upload-success');
+  const resumeBanner = document.getElementById('upload-resume-banner');
   const percentEl = document.getElementById('upload-percent');
   const speedEl = document.getElementById('upload-speed');
   const detailEl = document.getElementById('upload-detail');
@@ -179,161 +268,47 @@
   const strategyEl = document.getElementById('upload-strategy');
   const barEl = document.getElementById('upload-progress-bar');
 
-  const MULTIPART_THRESHOLD = {{ upload_single_put_threshold_mb|int }} * 1024 * 1024;
-  const FALLBACK_CHUNK_SIZE = {{ upload_chunk_size_mb|int }} * 1024 * 1024;
-  const FALLBACK_PARALLELISM = {{ upload_parallelism|int }};
-  const MAX_PART_RETRIES = 4;
-  const PART_RETRY_BASE_DELAY_MS = 800;
-  const PART_RETRY_MAX_DELAY_MS = 5000;
-  const PART_RETRY_AFTER_MAX_DELAY_MS = 15000;
-  const THROTTLE_CONCURRENCY_FLOOR = 1;
-  const THROTTLE_STREAK_REDUCE_THRESHOLD = 2;
-
-  const activeControllers = new Set();
-  let currentUploadId = null;
-  let currentAbort = false;
+  const PROXY_CHUNK_SIZE = {{ upload_proxy_chunk_size_mb|int }} * 1024 * 1024;
+  let currentTaskId = null;
+  let currentAbortController = null;
+  let pollTimer = null;
   let speedSamples = [];
+  const RESUME_STORAGE_KEY = 'serverProxyUploadResumeV1';
+  const TASK_REFRESH_INTERVAL_MS = 5000;
+
+  const currentPrefix = () => objectList?.dataset.currentPrefix || '';
+  const fileFingerprint = (file) => [file.name, file.size, file.type || '', file.lastModified || 0].join('::');
+  const saveResumeState = (payload) => { try { localStorage.setItem(RESUME_STORAGE_KEY, JSON.stringify(payload)); } catch (_) {} };
+  const loadResumeState = () => { try { const raw = localStorage.getItem(RESUME_STORAGE_KEY); return raw ? JSON.parse(raw) : null; } catch (_) { return null; } };
+  const clearResumeState = () => { try { localStorage.removeItem(RESUME_STORAGE_KEY); } catch (_) {} };
 
   const fmtBytes = (bytes) => {
     if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
     const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let value = bytes;
     let i = 0;
-    let val = bytes;
-    while (val >= 1024 && i < units.length - 1) {
-      val /= 1024;
-      i += 1;
-    }
-    return `${val.toFixed(val >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
+    while (value >= 1024 && i < units.length - 1) { value /= 1024; i += 1; }
+    return `${value.toFixed(value >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
   };
 
-  const fmtDuration = (seconds) => {
-    if (!Number.isFinite(seconds) || seconds < 0) return '--';
-    const rounded = Math.max(0, Math.round(seconds));
-    const h = Math.floor(rounded / 3600);
-    const m = Math.floor((rounded % 3600) / 60);
-    const s = rounded % 60;
-    if (h > 0) return `${h}小时${m}分`;
-    if (m > 0) return `${m}分${s}秒`;
-    return `${s}秒`;
+  const fmtTime = (value) => {
+    if (!value) return '--';
+    try { return new Date(value).toLocaleString('zh-CN', { hour12: false }); } catch (_) { return value; }
   };
 
   const showStatus = () => statusBox.classList.remove('hidden');
-  const showSuccess = (message) => {
-    successBox.textContent = message;
-    successBox.classList.remove('hidden');
-  };
   const hideSuccess = () => successBox.classList.add('hidden');
+  const hideResumeBanner = () => resumeBanner && resumeBanner.classList.add('hidden');
+  const showResumeBanner = (message) => { if (!resumeBanner) return; resumeBanner.textContent = message; resumeBanner.classList.remove('hidden'); };
+  const showSuccess = (message) => { successBox.textContent = message; successBox.classList.remove('hidden'); };
+  const showConflictFeedback = (message) => { if (!conflictFeedbackBox) return; conflictFeedbackBox.textContent = message; conflictFeedbackBox.classList.remove('hidden'); };
+  const hideConflictFeedback = () => { if (!conflictFeedbackBox) return; conflictFeedbackBox.classList.add('hidden'); conflictFeedbackBox.textContent = ''; };
 
-  const deleteFeedbackTemplate = document.getElementById('batch-delete-feedback-template');
-
-  const escapeHtml = (value) => String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-
-  const DELETE_FAILED_INLINE_LIMIT = 6;
-
-  const renderBatchDeleteFeedback = ({message, type = 'success', deletedCount = null, failedCount = null, failedNames = []}) => {
-    if (!deleteFeedbackBox) return;
-    if (!deleteFeedbackTemplate) {
-      deleteFeedbackBox.textContent = message;
-      deleteFeedbackBox.className = `alert ${type === 'error' ? 'alert-error' : 'alert-success'}`;
-      deleteFeedbackBox.classList.remove('hidden');
-      return;
-    }
-    const fragment = deleteFeedbackTemplate.content.cloneNode(true);
-    const summary = fragment.querySelector('.delete-feedback-summary');
-    const meta = fragment.querySelector('.delete-feedback-meta');
-    const successCountEl = fragment.querySelector('.js-delete-success-count');
-    const failedCountEl = fragment.querySelector('.js-delete-failed-count');
-    const failedWrap = fragment.querySelector('.delete-feedback-failed');
-    const failedList = fragment.querySelector('.js-delete-failed-list');
-    const failedMore = fragment.querySelector('.js-delete-failed-more');
-    const failedToggle = fragment.querySelector('.js-delete-failed-toggle');
-
-    if (summary) summary.textContent = message;
-    if (meta && (deletedCount !== null || failedCount !== null)) {
-      meta.classList.remove('hidden');
-      if (successCountEl) successCountEl.textContent = `成功 ${deletedCount ?? 0} 项`;
-      if (failedCountEl) failedCountEl.textContent = `失败 ${failedCount ?? 0} 项`;
-    }
-    if (failedWrap && failedList && failedNames.length > 0) {
-      failedWrap.classList.remove('hidden');
-      const inlineNames = failedNames.slice(0, DELETE_FAILED_INLINE_LIMIT);
-      const hiddenNames = failedNames.slice(DELETE_FAILED_INLINE_LIMIT);
-      failedList.innerHTML = inlineNames.map((name) => `<code>${escapeHtml(name)}</code>`).join('');
-      if (hiddenNames.length > 0 && failedMore && failedToggle) {
-        failedMore.innerHTML = hiddenNames.map((name) => `<code>${escapeHtml(name)}</code>`).join('');
-        failedToggle.classList.remove('hidden');
-        failedToggle.addEventListener('click', () => {
-          const expanded = failedToggle.getAttribute('aria-expanded') === 'true';
-          failedToggle.setAttribute('aria-expanded', expanded ? 'false' : 'true');
-          failedToggle.textContent = expanded ? `展开剩余 ${hiddenNames.length} 项` : '收起';
-          failedMore.classList.toggle('hidden', expanded);
-        });
-        failedToggle.textContent = `展开剩余 ${hiddenNames.length} 项`;
-      }
-    }
-
-    deleteFeedbackBox.innerHTML = '';
-    deleteFeedbackBox.appendChild(fragment);
-    deleteFeedbackBox.className = `alert ${type === 'error' ? 'alert-error' : 'alert-success'}`;
-    deleteFeedbackBox.classList.remove('hidden');
-  };
-
-  const showDeleteFeedback = (message, type = 'success') => {
-    renderBatchDeleteFeedback({message, type});
-  };
-
-  const hideDeleteFeedback = () => {
-    deleteFeedbackBox.classList.add('hidden');
-    deleteFeedbackBox.innerHTML = '';
-  };
-
-  const getObjectRow = (objectName) => objectList ? objectList.querySelector(`[data-object-row][data-object-name="${CSS.escape(objectName)}"]`) : null;
-
-  const getSelectBoxes = () => objectList ? Array.from(objectList.querySelectorAll('.js-object-select')) : [];
-
-  const getSelectedObjectNames = () => getSelectBoxes().filter((input) => input.checked && !input.disabled).map((input) => input.value);
-
-  const updateObjectCount = () => {
-    if (!objectCountPill || !objectList) return;
-    const count = objectList.querySelectorAll('[data-object-row]').length;
-    objectCountPill.textContent = `共 ${count} 项`;
-  };
-
-  const ensureEmptyState = () => {
-    if (!objectList) return;
-    const remainingRows = objectList.querySelectorAll('[data-object-row]');
-    if (remainingRows.length > 0) return;
-    objectList.innerHTML = '<div class="empty-state">这里还没有对象，或者当前前缀下没有结果。</div>';
-  };
-
-  const syncBatchDeleteToolbar = () => {
-    if (!batchDeleteToolbar || !batchDeleteSelection || !batchDeleteButton) return;
-    const boxes = getSelectBoxes();
-    const selected = boxes.filter((input) => input.checked && !input.disabled);
-    const enabledCount = boxes.filter((input) => !input.disabled).length;
-    const count = selected.length;
-    batchDeleteSelection.textContent = `已选 ${count} 项`;
-    batchDeleteButton.disabled = count === 0;
-    if (batchDownloadButton) batchDownloadButton.disabled = count === 0;
-    if (batchDeleteClear) batchDeleteClear.disabled = count === 0;
-    if (batchDeleteSelectAll) batchDeleteSelectAll.disabled = enabledCount === 0 || count === enabledCount;
-    batchDeleteToolbar.classList.toggle('hidden', boxes.length === 0);
-  };
-
-  const resetSpeedSamples = () => {
-    speedSamples = [];
-  };
-
+  const resetSpeedSamples = () => { speedSamples = []; };
   const computeSmoothedSpeed = (loaded) => {
     const now = Date.now();
     speedSamples.push({ ts: now, loaded });
-    const windowMs = 3000;
-    speedSamples = speedSamples.filter((sample) => now - sample.ts <= windowMs);
+    speedSamples = speedSamples.filter((sample) => now - sample.ts <= 3000);
     if (speedSamples.length < 2) return 0;
     const first = speedSamples[0];
     const last = speedSamples[speedSamples.length - 1];
@@ -342,12 +317,26 @@
     return deltaBytes / deltaSeconds;
   };
 
+  const updateProgress = ({ loaded, total, strategy, detail, etaText, speedText }) => {
+    const percent = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+    const speed = computeSmoothedSpeed(loaded);
+    const computedEtaSeconds = speed > 0 && total > loaded ? Math.max(0, Math.round((total - loaded) / speed)) : null;
+    const computedEtaText = computedEtaSeconds !== null
+      ? (computedEtaSeconds < 60 ? `预计剩余 ${computedEtaSeconds} 秒` : `预计剩余 ${Math.ceil(computedEtaSeconds / 60)} 分钟`)
+      : null;
+    percentEl.textContent = `${percent}%`;
+    speedEl.textContent = speedText || (speed > 0 ? `${fmtBytes(speed)}/s` : '正在上传到服务器…');
+    detailEl.textContent = detail || `${fmtBytes(loaded)} / ${fmtBytes(total)} · ${percent}%`;
+    etaEl.textContent = etaText || computedEtaText || '正在上传到服务器…';
+    strategyEl.textContent = `策略：${strategy}`;
+    barEl.style.width = `${percent}%`;
+  };
+
   const setIdle = () => {
     submitBtn.disabled = false;
     submitBtn.textContent = '上传到 Bucket';
     cancelBtn.classList.add('hidden');
-    currentUploadId = null;
-    activeControllers.clear();
+    currentAbortController = null;
     resetSpeedSamples();
   };
 
@@ -356,19 +345,6 @@
     submitBtn.textContent = '上传中...';
     cancelBtn.classList.remove('hidden');
     resetSpeedSamples();
-  };
-
-  const updateProgress = ({ loaded, total, strategy }) => {
-    const percent = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
-    const speed = computeSmoothedSpeed(loaded);
-    const remaining = Math.max(total - loaded, 0);
-    const eta = speed > 0 ? remaining / speed : Number.NaN;
-    percentEl.textContent = `${percent}%`;
-    speedEl.textContent = speed > 0 ? `${fmtBytes(speed)}/s` : '计算中...';
-    detailEl.textContent = `${fmtBytes(loaded)} / ${fmtBytes(total)}`;
-    etaEl.textContent = `ETA ${fmtDuration(eta)}`;
-    strategyEl.textContent = `策略：${strategy}`;
-    barEl.style.width = `${percent}%`;
   };
 
   const jsonFetch = async (url, options = {}) => {
@@ -386,353 +362,73 @@
       const detail = typeof payload === 'string' ? payload : payload.detail || payload.message || `HTTP ${response.status}`;
       const error = new Error(detail);
       error.payload = typeof payload === 'string' ? null : payload;
+      error.status = response.status;
       throw error;
     }
     return payload;
   };
 
-  const buildFingerprint = async (file) => {
-    const sample = file.slice(0, Math.min(file.size, 1024 * 1024));
-    const buffer = await sample.arrayBuffer();
-    const subtle = globalThis.crypto && globalThis.crypto.subtle;
-    if (subtle && typeof subtle.digest === 'function') {
-      const digest = await subtle.digest('SHA-256', buffer);
-      const hashHex = Array.from(new Uint8Array(digest)).map((x) => x.toString(16).padStart(2, '0')).join('');
-      return `${file.name}:${file.size}:${file.lastModified}:${hashHex}`;
-    }
-
-    const bytes = new Uint8Array(buffer);
-    let acc = 0;
-    const step = Math.max(1, Math.floor(bytes.length / 64));
-    for (let i = 0; i < bytes.length; i += step) {
-      acc = (acc * 131 + bytes[i]) >>> 0;
-    }
-    const fallbackHex = acc.toString(16).padStart(8, '0');
-    return `${file.name}:${file.size}:${file.lastModified}:${bytes.length}:${fallbackHex}`;
+  const isConflictError = (error) => Number(error?.status) === 409 && error?.payload?.conflict;
+  const buildConflictMessage = (payload) => {
+    const conflict = payload?.conflict || {};
+    const destination = conflict.destination_path || '目标路径';
+    const existing = Array.isArray(conflict.existing_paths) && conflict.existing_paths.length > 0
+      ? ` 已存在：${conflict.existing_paths.join('，')}`
+      : '';
+    return `${payload?.detail || '发现同名冲突。'} 目标：${destination}。${existing}`.trim();
   };
 
-  const uploadSingle = (file) => new Promise((resolve, reject) => {
-    const xhr = new XMLHttpRequest();
-    const data = new FormData();
-    data.append('file', file);
-    currentAbort = false;
-
-    xhr.upload.addEventListener('progress', (e) => {
-      if (!e.lengthComputable) return;
-      updateProgress({loaded: e.loaded, total: e.total, strategy: '单请求直传'});
-    });
-
-    xhr.addEventListener('load', () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        try {
-          resolve(JSON.parse(xhr.responseText || '{}'));
-        } catch (_) {
-          resolve({message: '上传完成'});
-        }
-        return;
-      }
-      try {
-        const payload = JSON.parse(xhr.responseText || '{}');
-        reject(new Error(payload.detail || payload.message || `HTTP ${xhr.status}`));
-      } catch (_) {
-        reject(new Error(`HTTP ${xhr.status}`));
-      }
-    });
-
-    xhr.addEventListener('error', () => reject(new Error('上传失败：连接被中断，可能是代理或网络提前断开')));
-    xhr.addEventListener('timeout', () => reject(new Error('上传失败：请求超时')));
-    xhr.addEventListener('abort', () => reject(new Error('上传已取消')));
-    xhr.open('POST', form.action, true);
-    xhr.timeout = 10 * 60 * 1000;
-    xhr.setRequestHeader('X-Requested-With', 'XMLHttpRequest');
-    xhr.send(data);
-
-    activeControllers.add({abort: () => xhr.abort()});
-  });
-
-  const sleep = (ms) => new Promise((resolve) => window.setTimeout(resolve, ms));
-
-  const normalizePartUploadError = (partNum, error) => {
-    const payload = error && typeof error === 'object' && 'payload' in error ? error.payload : null;
-    const errorCode = payload && payload.error_code ? payload.error_code : 'unknown';
-    const retryable = typeof (payload && payload.retryable) === 'boolean'
-      ? payload.retryable
-      : ['timeout', 'connection', 'http_5xx', 'http_429'].includes(errorCode);
-    const reason = payload && payload.reason
-      ? payload.reason
-      : (error && error.message ? error.message : `分片 ${partNum} 上传失败`);
-    let retryAfterSeconds = null;
-    if (payload && Number.isFinite(Number(payload.retry_after_seconds))) {
-      retryAfterSeconds = Math.max(0, Math.round(Number(payload.retry_after_seconds)));
+  const deleteFeedbackTemplate = document.getElementById('batch-delete-feedback-template');
+  const renderBatchDeleteFeedback = ({message, type = 'success'}) => {
+    if (!deleteFeedbackBox) return;
+    if (!deleteFeedbackTemplate) {
+      deleteFeedbackBox.textContent = message;
+      deleteFeedbackBox.className = `alert ${type === 'error' ? 'alert-error' : 'alert-success'}`;
+      deleteFeedbackBox.classList.remove('hidden');
+      return;
     }
-    return {
-      errorCode,
-      retryable,
-      reason,
-      retryAfterSeconds,
-      message: payload && payload.detail ? payload.detail : reason,
-    };
+    const fragment = deleteFeedbackTemplate.content.cloneNode(true);
+    const summary = fragment.querySelector('.delete-feedback-summary');
+    if (summary) summary.textContent = message;
+    deleteFeedbackBox.innerHTML = '';
+    deleteFeedbackBox.appendChild(fragment);
+    deleteFeedbackBox.className = `alert ${type === 'error' ? 'alert-error' : 'alert-success'}`;
+    deleteFeedbackBox.classList.remove('hidden');
+  };
+  const showDeleteFeedback = (message, type = 'success') => renderBatchDeleteFeedback({message, type});
+  const hideDeleteFeedback = () => { deleteFeedbackBox.classList.add('hidden'); deleteFeedbackBox.innerHTML = ''; };
+
+  const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+  const getObjectRow = (objectName) => objectList ? objectList.querySelector(`[data-object-row][data-object-name="${CSS.escape(objectName)}"]`) : null;
+  const getSelectBoxes = () => objectList ? Array.from(objectList.querySelectorAll('.js-object-select')) : [];
+  const getSelectedObjectNames = () => getSelectBoxes().filter((input) => input.checked && !input.disabled).map((input) => input.value);
+
+  const updateObjectCount = () => {
+    if (!objectCountPill || !objectList) return;
+    objectCountPill.textContent = `共 ${objectList.querySelectorAll('[data-object-row]').length} 项`;
   };
 
-  const retryDelayFor = (errorCode, attempt, retryAfterSeconds = null) => {
-    const jitter = Math.floor(Math.random() * 250);
-    if (errorCode === 'http_429' && Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
-      return Math.min(PART_RETRY_AFTER_MAX_DELAY_MS, retryAfterSeconds * 1000 + jitter);
-    }
-    if (errorCode === 'timeout') {
-      return Math.min(PART_RETRY_MAX_DELAY_MS, 1200 * attempt + jitter);
-    }
-    if (errorCode === 'connection') {
-      return Math.min(PART_RETRY_MAX_DELAY_MS, 900 * attempt + jitter);
-    }
-    if (errorCode === 'http_5xx' || errorCode === 'http_429') {
-      return Math.min(PART_RETRY_MAX_DELAY_MS, PART_RETRY_BASE_DELAY_MS * (2 ** (attempt - 1)) + jitter);
-    }
-    return Math.min(PART_RETRY_MAX_DELAY_MS, PART_RETRY_BASE_DELAY_MS * attempt + jitter);
+  const ensureEmptyState = () => {
+    if (!objectList) return;
+    if (objectList.querySelectorAll('[data-object-row]').length > 0) return;
+    objectList.innerHTML = '<div class="empty-state">这里还没有对象，或者当前前缀下没有结果。</div>';
   };
 
-  const retryLabelFor = (errorCode) => {
-    if (errorCode === 'timeout') return '请求超时';
-    if (errorCode === 'connection') return '连接中断';
-    if (errorCode === 'http_5xx') return '服务端 5xx';
-    if (errorCode === 'http_429') return 'OCI 限流 429';
-    if (errorCode === 'http_4xx') return '请求被拒绝/4xx';
-    return '未知错误';
-  };
-
-  const uploadMultipart = async (file) => {
-    const fingerprint = await buildFingerprint(file);
-    const init = await jsonFetch('/api/uploads/init', {
-      method: 'POST',
-      body: JSON.stringify({
-        filename: file.name,
-        file_size: file.size,
-        content_type: file.type || 'application/octet-stream',
-        file_fingerprint: fingerprint,
-      }),
-    });
-
-    if (init.remote_reconcile_degraded && init.remote_reconcile_warning) {
-      showDeleteFeedback(`⚠️ ${init.remote_reconcile_warning}`, 'error');
-    }
-
-    currentUploadId = init.upload_id;
-    const chunkSize = init.chunk_size || FALLBACK_CHUNK_SIZE;
-    const parallelism = Math.max(1, init.parallelism || FALLBACK_PARALLELISM);
-    const totalParts = Math.ceil(file.size / chunkSize);
-    const doneParts = new Set(init.uploaded_parts || []);
-    const partLoaded = new Map();
-    let loadedBase = 0;
-    let targetConcurrency = parallelism;
-    let activeWorkers = 0;
-    let throttle429Streak = 0;
-    let throttledNoticeShown = false;
-    if (doneParts.size > 0) {
-      for (const partNum of doneParts) {
-        const start = (partNum - 1) * chunkSize;
-        loadedBase += Math.max(0, Math.min(chunkSize, file.size - start));
-      }
-    }
-
-    const currentStrategyLabel = () => {
-      if (targetConcurrency < parallelism) {
-        return `策略：OCI multipart 分片并发上传（限流收敛至 ${targetConcurrency}/${parallelism} 路）`;
-      }
-      return '策略：OCI multipart 分片并发上传';
-    };
-
-    const updateAggregateProgress = () => {
-      let inflightLoaded = 0;
-      for (const value of partLoaded.values()) inflightLoaded += value;
-      updateProgress({loaded: loadedBase + inflightLoaded, total: file.size, strategy: currentStrategyLabel().replace('策略：', '')});
-      strategyEl.textContent = currentStrategyLabel();
-    };
-
-    const noteConcurrencyReduction = (reason) => {
-      throttledNoticeShown = true;
-      detailEl.textContent = `检测到连续限流，已临时下调上传并发到 ${targetConcurrency}/${parallelism} 路；${reason}`;
-      etaEl.textContent = 'ETA 已按降并发重新估算';
-      strategyEl.textContent = currentStrategyLabel();
-    };
-
-    const maybeReduceConcurrency = ({retryAfterSeconds = null} = {}) => {
-      throttle429Streak += 1;
-      if (throttle429Streak < THROTTLE_STREAK_REDUCE_THRESHOLD) return false;
-      if (targetConcurrency <= THROTTLE_CONCURRENCY_FLOOR) return false;
-      targetConcurrency -= 1;
-      throttle429Streak = 0;
-      const waitHint = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
-        ? `当前遵循服务端建议等待约 ${retryAfterSeconds} 秒`
-        : '当前继续保守退避重试';
-      noteConcurrencyReduction(waitHint);
-      return true;
-    };
-
-    const noteThrottleRecovered = () => {
-      if (!throttledNoticeShown || targetConcurrency >= parallelism) return;
-      detailEl.textContent = `限流趋稳，当前并发已收敛到 ${targetConcurrency}/${parallelism} 路并继续上传`;
-      etaEl.textContent = 'ETA 持续更新中';
-    };
-
-    updateAggregateProgress();
-    if (init.remote_reconcile_degraded) {
-      detailEl.textContent = '远端对账暂未完成，当前按本地会话状态继续补传；完成前会再次校验';
-    } else {
-      detailEl.textContent = init.reused ? '已恢复未完成上传，继续补传剩余分片' : '已创建上传会话，开始并发上传分片';
-    }
-    if ((init.uploaded_parts || []).length > 0) {
-      etaEl.textContent = 'ETA 重新估算中';
-    }
-
-    const partQueue = [];
-    for (let partNum = 1; partNum <= totalParts; partNum += 1) {
-      if (!doneParts.has(partNum)) partQueue.push(partNum);
-    }
-
-    const uploadOnePartOnce = (partNum) => new Promise((resolve, reject) => {
-      const start = (partNum - 1) * chunkSize;
-      const end = Math.min(start + chunkSize, file.size);
-      const blob = file.slice(start, end);
-      const xhr = new XMLHttpRequest();
-      const controller = { abort: () => xhr.abort() };
-      activeControllers.add(controller);
-      partLoaded.set(partNum, 0);
-
-      xhr.upload.addEventListener('progress', (e) => {
-        if (!e.lengthComputable) return;
-        partLoaded.set(partNum, e.loaded);
-        updateAggregateProgress();
-        detailEl.textContent = `正在上传分片 ${partNum}/${totalParts}`;
-      });
-
-      xhr.addEventListener('load', () => {
-        activeControllers.delete(controller);
-        if (xhr.status >= 200 && xhr.status < 300) {
-          let payload = {};
-          try {
-            payload = JSON.parse(xhr.responseText || '{}');
-          } catch (_) {}
-          partLoaded.delete(partNum);
-          loadedBase += blob.size;
-          updateAggregateProgress();
-          detailEl.textContent = `分片 ${partNum}/${totalParts} 已上传`;
-          resolve(payload);
-          return;
-        }
-        partLoaded.delete(partNum);
-        updateAggregateProgress();
-        let detail = `HTTP ${xhr.status}`;
-        try {
-          const payload = JSON.parse(xhr.responseText || '{}');
-          detail = payload.detail || payload.message || detail;
-        } catch (_) {}
-        reject(new Error(detail));
-      });
-
-      xhr.addEventListener('error', () => {
-        activeControllers.delete(controller);
-        partLoaded.delete(partNum);
-        updateAggregateProgress();
-        reject(new Error(`分片 ${partNum} 上传失败：连接中断`));
-      });
-
-      xhr.addEventListener('timeout', () => {
-        activeControllers.delete(controller);
-        partLoaded.delete(partNum);
-        updateAggregateProgress();
-        reject(new Error(`分片 ${partNum} 上传失败：请求超时`));
-      });
-
-      xhr.addEventListener('abort', () => {
-        activeControllers.delete(controller);
-        partLoaded.delete(partNum);
-        updateAggregateProgress();
-        reject(new Error('上传已取消'));
-      });
-
-      xhr.open('PUT', `/api/uploads/${encodeURIComponent(currentUploadId)}/part/${partNum}`, true);
-      xhr.timeout = 10 * 60 * 1000;
-      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
-      xhr.send(blob);
-    });
-
-    const uploadOnePart = async (partNum) => {
-      let attempt = 0;
-      while (attempt < MAX_PART_RETRIES) {
-        attempt += 1;
-        try {
-          const result = await uploadOnePartOnce(partNum);
-          throttle429Streak = 0;
-          noteThrottleRecovered();
-          return result;
-        } catch (error) {
-          if (currentAbort) throw error;
-          const info = normalizePartUploadError(partNum, error);
-          const errorLabel = retryLabelFor(info.errorCode);
-          if (!info.retryable) {
-            detailEl.textContent = `分片 ${partNum} 失败：${errorLabel}；已停止重试`;
-            throw new Error(`分片 ${partNum} 上传失败：${info.reason}（${errorLabel}，不可重试，已停止）`);
-          }
-          if (attempt >= MAX_PART_RETRIES) {
-            detailEl.textContent = `分片 ${partNum} 失败：${errorLabel}；已达到重试上限`;
-            throw new Error(`分片 ${partNum} 上传失败：${info.reason}（${errorLabel}，已重试 ${attempt} 次后停止）`);
-          }
-          const nextAttempt = attempt + 1;
-          const delayMs = retryDelayFor(info.errorCode, attempt, info.retryAfterSeconds);
-          const waitHint = info.errorCode === 'http_429' && Number.isFinite(info.retryAfterSeconds) && info.retryAfterSeconds > 0
-            ? `，遵循服务端建议等待约 ${info.retryAfterSeconds} 秒`
-            : '';
-          if (info.errorCode === 'http_429') {
-            maybeReduceConcurrency({retryAfterSeconds: info.retryAfterSeconds});
-          } else {
-            throttle429Streak = 0;
-          }
-          const concurrencyHint = info.errorCode === 'http_429' && targetConcurrency < parallelism
-            ? `；当前并发已收敛到 ${targetConcurrency}/${parallelism} 路`
-            : '';
-          detailEl.textContent = `分片 ${partNum} 失败：${errorLabel}；${Math.ceil(delayMs / 1000)} 秒后重试第 ${nextAttempt}/${MAX_PART_RETRIES} 次${waitHint}${concurrencyHint}`;
-          strategyEl.textContent = info.errorCode === 'http_429'
-            ? currentStrategyLabel().replace('）', '，限流退避中）')
-            : currentStrategyLabel();
-          etaEl.textContent = `ETA 重试等待 ${fmtDuration(delayMs / 1000)}`;
-          await sleep(delayMs);
-        }
-      }
-      throw new Error(`分片 ${partNum} 上传失败`);
-    };
-
-    const workerLoop = async () => {
-      activeWorkers += 1;
-      try {
-        while (partQueue.length > 0) {
-          if (currentAbort) throw new Error('上传已取消');
-          if (activeWorkers > targetConcurrency) return;
-          const partNum = partQueue.shift();
-          if (!partNum) return;
-          await uploadOnePart(partNum);
-        }
-      } finally {
-        activeWorkers = Math.max(0, activeWorkers - 1);
-      }
-    };
-
-    const workers = Array.from({length: parallelism}, () => workerLoop());
-
-    await Promise.all(workers);
-    strategyEl.textContent = '策略：OCI multipart 分片并发上传';
-    detailEl.textContent = '分片上传完成，正在合并...';
-    const completed = await jsonFetch(`/api/uploads/${encodeURIComponent(currentUploadId)}/complete`, {
-      method: 'POST',
-    });
-    updateProgress({loaded: file.size, total: file.size, strategy: 'OCI multipart 分片并发上传'});
-    detailEl.textContent = '上传完成';
-    etaEl.textContent = 'ETA 0秒';
-    return completed;
+  const syncBatchDeleteToolbar = () => {
+    if (!batchDeleteToolbar || !batchDeleteSelection || !batchDeleteButton) return;
+    const boxes = getSelectBoxes();
+    const selected = boxes.filter((input) => input.checked && !input.disabled);
+    const enabledCount = boxes.filter((input) => !input.disabled).length;
+    batchDeleteSelection.textContent = `已选 ${selected.length} 项`;
+    batchDeleteButton.disabled = selected.length === 0;
+    if (batchDownloadButton) batchDownloadButton.disabled = selected.length === 0;
+    if (batchDeleteClear) batchDeleteClear.disabled = selected.length === 0;
+    if (batchDeleteSelectAll) batchDeleteSelectAll.disabled = enabledCount === 0 || selected.length === enabledCount;
+    batchDeleteToolbar.classList.toggle('hidden', boxes.length === 0);
   };
 
   const removeObjectRows = (objectNames) => {
-    const uniqueNames = Array.from(new Set(objectNames));
-    uniqueNames.forEach((objectName) => {
+    Array.from(new Set(objectNames)).forEach((objectName) => {
       const row = getObjectRow(objectName);
       if (!row) return;
       row.classList.add('object-card-deleting');
@@ -745,148 +441,337 @@
     });
   };
 
-  const setRowPending = (objectNames, pending = true) => {
-    objectNames.forEach((objectName) => {
-      const row = getObjectRow(objectName);
-      if (!row) return;
-      row.classList.toggle('object-card-pending-delete', pending);
-    });
+  const buildFolderRow = (folder) => {
+    const article = document.createElement('article');
+    article.className = 'object-card object-card-unified object-row-card';
+    article.dataset.objectRow = '';
+    article.dataset.objectName = folder.full_prefix;
+    article.dataset.objectKind = 'folder';
+    article.innerHTML = `
+      <div class="object-row-shell folder-row-shell">
+        <div class="object-row-main">
+          <div class="object-main">
+            <div class="object-name">📁 ${escapeHtml(folder.name)}/</div>
+            <div class="object-subline">
+              <span>目录</span>
+              <span class="dot-sep">•</span>
+              <span>子项 ${escapeHtml(folder.item_count ?? 0)}</span>
+              ${folder.placeholder_exists ? '<span class="dot-sep">•</span><span>含目录占位对象</span>' : ''}
+            </div>
+          </div>
+        </div>
+        <div class="object-thumb-wrap"><div class="object-file-icon" aria-label="目录">📁</div></div>
+      </div>
+      <div class="object-toolbar">
+        <a class="toolbar-link" href="/?prefix=${encodeURIComponent(folder.full_prefix)}">打开</a>
+        <button class="toolbar-link js-rename-path" type="button" data-path="${escapeHtml(folder.full_prefix)}" data-kind="folder" data-display-name="${escapeHtml(folder.name)}">重命名</button>
+        <button class="toolbar-link toolbar-link-danger js-delete-path" type="button" data-path="${escapeHtml(folder.full_prefix)}" data-kind="folder">删除目录</button>
+      </div>`;
+    return article;
   };
 
-  const updateSelectedInputs = (objectNames, {disabled, checked} = {}) => {
-    const boxes = getSelectBoxes();
-    objectNames.forEach((objectName) => {
-      const input = boxes.find((box) => box.value === objectName);
-      if (!input) return;
-      if (typeof disabled === 'boolean') input.disabled = disabled;
-      if (typeof checked === 'boolean') input.checked = checked;
-    });
-    syncBatchDeleteToolbar();
+  const buildFileRow = (file) => {
+    const article = document.createElement('article');
+    article.className = 'object-card object-card-unified object-row-card';
+    article.dataset.objectRow = '';
+    article.dataset.objectName = file.name;
+    article.dataset.objectKind = 'file';
+    const basename = String(file.name || '').split('/').pop() || file.name || '';
+    article.innerHTML = `
+      <div class="object-row-shell object-row-shell-selectable">
+        <label class="object-select-control" aria-label="选择 ${escapeHtml(file.name)}">
+          <input class="object-select-checkbox js-object-select" type="checkbox" value="${escapeHtml(file.name)}" data-object-name="${escapeHtml(file.name)}">
+          <span class="object-select-box" aria-hidden="true"></span>
+        </label>
+        <div class="object-row-main">
+          <div class="object-main">
+            <div class="object-name">${escapeHtml(basename)}</div>
+            <div class="object-subline">
+              <span>${escapeHtml(file.file_type_label || '文件')}</span>
+              ${file.content_type ? `<span class="dot-sep">•</span><span title="${escapeHtml(file.content_type)}">${escapeHtml(file.content_type)}</span>` : ''}
+              ${file.time_display ? `<span class="dot-sep">•</span><span>创建于 ${escapeHtml(file.time_display)}</span>` : ''}
+            </div>
+            ${currentPrefix() && file.name !== basename ? `<div class="object-subline"><span>完整路径：<code>${escapeHtml(file.name)}</code></span></div>` : ''}
+          </div>
+          <span class="object-size-badge">${escapeHtml(file.size_display || '')}</span>
+        </div>
+        <div class="object-thumb-wrap"><div class="object-file-icon" aria-label="文件">📄</div></div>
+      </div>
+      <div class="object-toolbar">
+        <a class="toolbar-link" href="/view/${file.name}">预览</a>
+        <a class="toolbar-link" href="/download/${file.name}">下载</a>
+        <button class="toolbar-link js-rename-path" type="button" data-path="${escapeHtml(file.name)}" data-kind="file" data-display-name="${escapeHtml(basename)}">重命名</button>
+        <button class="toolbar-link toolbar-link-danger js-delete-object js-delete-path" type="button" data-object-name="${escapeHtml(file.name)}" data-path="${escapeHtml(file.name)}" data-kind="file">删除</button>
+      </div>`;
+    return article;
   };
 
-  const triggerBatchDownload = () => {
-    const selected = getSelectedObjectNames();
-    if (selected.length === 0) return;
-    if (!batchDownloadForm || !batchDownloadHiddenInputs) return;
-
-    hideSuccess();
-    hideDeleteFeedback();
-    const originText = batchDownloadButton.textContent;
-    batchDownloadButton.disabled = true;
-    batchDeleteButton.disabled = true;
-    if (batchDeleteClear) batchDeleteClear.disabled = true;
-    batchDownloadButton.textContent = '准备下载...';
-
-    const currentPrefix = objectList?.dataset.currentPrefix || '';
-    const prefixInput = batchDownloadForm.querySelector('input[name="prefix"]');
-    if (prefixInput) prefixInput.value = currentPrefix;
-
-    batchDownloadHiddenInputs.innerHTML = '';
-    selected.forEach((objectName) => {
-      const input = document.createElement('input');
-      input.type = 'hidden';
-      input.name = 'object_names';
-      input.value = objectName;
-      batchDownloadHiddenInputs.appendChild(input);
-    });
-
-    try {
-      batchDownloadForm.submit();
-      showDeleteFeedback('✅ 已提交批量下载，浏览器将直接接管 ZIP 下载；若有部分失败，压缩包内会附失败清单。', 'success');
-    } catch (error) {
-      showDeleteFeedback(`批量下载失败：${error.message || error}`, 'error');
-    } finally {
-      batchDownloadButton.textContent = originText;
-      syncBatchDeleteToolbar();
-    }
-  };
-
-  const handleBatchDelete = async () => {
-    const selected = getSelectedObjectNames();
-    if (selected.length === 0) return;
-    const ok = window.confirm(`确认批量删除已选中的 ${selected.length} 个对象吗？删除后不可恢复。`);
-    if (!ok) return;
-
-    hideSuccess();
-    hideDeleteFeedback();
-    batchDeleteButton.disabled = true;
-    if (batchDownloadButton) batchDownloadButton.disabled = true;
-    batchDeleteClear.disabled = true;
-    const originBatchText = batchDeleteButton.textContent;
-    batchDeleteButton.textContent = '删除中...';
-    setRowPending(selected, true);
-    updateSelectedInputs(selected, {disabled: true, checked: true});
-
-    try {
-      const result = await jsonFetch('/objects/batch-delete', {
-        method: 'POST',
-        body: JSON.stringify({object_names: selected}),
-      });
-      const deletedNames = Array.isArray(result.deleted) ? result.deleted : [];
-      removeObjectRows(deletedNames);
-      renderBatchDeleteFeedback({
-        message: `✅ ${result.message || `已删除 ${result.deleted_count || 0} 个对象`}`,
-        type: 'success',
-        deletedCount: result.deleted_count ?? deletedNames.length,
-        failedCount: result.failed_count ?? 0,
-        failedNames: [],
-      });
-    } catch (error) {
-      const message = error.message || String(error);
-      let responsePayload = null;
-      if (error && typeof error === 'object' && 'payload' in error) {
-        responsePayload = error.payload;
-      }
-      if (responsePayload) {
-        const deletedNames = Array.isArray(responsePayload.deleted) ? responsePayload.deleted : [];
-        const failedNames = Array.isArray(responsePayload.failed)
-          ? responsePayload.failed.map((item) => item.object_name).filter(Boolean)
-          : [];
-        if (deletedNames.length > 0) {
-          removeObjectRows(deletedNames);
+  const bindRowActions = (root = document) => {
+    root.querySelectorAll('.js-rename-path').forEach((button) => {
+      if (button.dataset.bound === '1') return;
+      button.dataset.bound = '1';
+      button.addEventListener('click', async () => {
+        const sourcePath = button.dataset.path || '';
+        const displayName = button.dataset.displayName || '';
+        const kind = button.dataset.kind || 'file';
+        const newName = window.prompt(`请输入${kind === 'folder' ? '目录' : '文件'}的新名称`, displayName);
+        if (!newName || newName === displayName) return;
+        try {
+          hideConflictFeedback();
+          const result = await jsonFetch('/api/files/rename', { method: 'POST', body: JSON.stringify({ source_path: sourcePath, new_name: newName }) });
+          showDeleteFeedback(`✅ ${result.message || '重命名成功'}`, 'success');
+          window.location.reload();
+        } catch (error) {
+          if (isConflictError(error)) {
+            const message = buildConflictMessage(error.payload);
+            showConflictFeedback(`⚠️ ${message}`);
+            if (window.confirm(`${message}\n\n确认覆盖并继续吗？`)) {
+              try {
+                const result = await jsonFetch('/api/files/rename', { method: 'POST', body: JSON.stringify({ source_path: sourcePath, new_name: newName, overwrite: true }) });
+                hideConflictFeedback();
+                showDeleteFeedback(`✅ ${result.message || '重命名成功'}`, 'success');
+                window.location.reload();
+                return;
+              } catch (retryError) {
+                showDeleteFeedback(`重命名失败：${retryError.message || retryError}`, 'error');
+                return;
+              }
+            }
+            return;
+          }
+          showDeleteFeedback(`重命名失败：${error.message || error}`, 'error');
         }
-        setRowPending(failedNames, false);
-        updateSelectedInputs(failedNames, {disabled: false, checked: true});
-        renderBatchDeleteFeedback({
-          message: `${deletedNames.length > 0 ? '⚠️ ' : ''}${responsePayload.message || '部分对象删除失败'}`,
-          type: 'error',
-          deletedCount: responsePayload.deleted_count ?? deletedNames.length,
-          failedCount: responsePayload.failed_count ?? failedNames.length,
-          failedNames,
-        });
-      } else {
-        setRowPending(selected, false);
-        updateSelectedInputs(selected, {disabled: false, checked: true});
-        showDeleteFeedback(`删除失败：${message}`, 'error');
-      }
+      });
+    });
+
+    root.querySelectorAll('.js-delete-path').forEach((button) => {
+      if (button.dataset.bound === '1') return;
+      button.dataset.bound = '1';
+      button.addEventListener('click', async () => {
+        const path = button.dataset.path || button.dataset.objectName || '';
+        const kind = button.dataset.kind || 'file';
+        const message = kind === 'folder'
+          ? `确认删除目录「${path}」吗？会删除该目录下全部对象，且不可恢复。`
+          : `确认删除对象「${path}」吗？删除后不可恢复。`;
+        if (!window.confirm(message)) return;
+        try {
+          if (kind === 'file' && button.classList.contains('js-delete-object')) {
+            const result = await jsonFetch(`/objects/${encodeURIComponent(path).replace(/%2F/g, '/')}`, { method: 'DELETE' });
+            removeObjectRows([path]);
+            showDeleteFeedback(`✅ ${result.detail || result.message || '删除成功'}`, 'success');
+            return;
+          }
+          const result = await jsonFetch('/api/files/delete', { method: 'POST', body: JSON.stringify({ path }) });
+          if (kind === 'folder') {
+            showDeleteFeedback(`✅ ${result.message || '目录删除成功'}`, 'success');
+            window.location.reload();
+            return;
+          }
+          removeObjectRows([path]);
+          showDeleteFeedback(`✅ ${result.message || '删除成功'}`, 'success');
+        } catch (error) {
+          showDeleteFeedback(`删除失败：${error.message || error}`, 'error');
+        }
+      });
+    });
+  };
+
+  const scheduleTaskRefresh = (delayMs = TASK_REFRESH_INTERVAL_MS) => {
+    stopPolling();
+    pollTimer = window.setTimeout(() => {
+      refreshTasks({ scheduleNext: true });
+    }, delayMs);
+  };
+
+  const refreshTasks = async ({ scheduleNext = false } = {}) => {
+    try {
+      const result = await jsonFetch('/api/server-uploads/tasks');
+      renderTasks(result.tasks || []);
+    } catch (_) {
+      // ignore background refresh noise
     } finally {
-      batchDeleteButton.textContent = originBatchText;
-      batchDeleteClear.disabled = false;
-      syncBatchDeleteToolbar();
+      if (scheduleNext) scheduleTaskRefresh();
     }
   };
 
-  fileInput.addEventListener('change', () => {
+  const renderTasks = (tasks) => {
+    if (!taskList) return;
+    if (!tasks || tasks.length === 0) {
+      taskList.innerHTML = '<div class="empty-state">还没有上传任务。</div>';
+      return;
+    }
+    taskList.innerHTML = tasks.map((task) => {
+      const percent = Number.isFinite(Number(task.progress)) ? Number(task.progress) : 0;
+      const partsLabel = task.total_parts ? ` · parts ${Array.isArray(task.uploaded_parts) ? task.uploaded_parts.length : 0}/${task.total_parts}` : '';
+      const statusLabel = task.status_label || task.status;
+      const phaseLabel = task.phase_label || task.current_phase || task.phase || '等待执行';
+      const recoveryBadges = [];
+      if (task.recovered) recoveryBadges.push('<span class="task-state-pill task-state-pill-info">恢复任务</span>');
+      if (task.recovery_attempted && !task.recovered) recoveryBadges.push('<span class="task-state-pill task-state-pill-warning">尝试恢复</span>');
+      if (task.recovery_problem === 'missing_temp_file') recoveryBadges.push('<span class="task-state-pill task-state-pill-danger">暂存文件丢失</span>');
+      if (task.is_retrying) recoveryBadges.push('<span class="task-state-pill task-state-pill-warning">后台重试中</span>');
+      const recoveryMeta = [];
+      if (task.recovery_source_status) recoveryMeta.push(`恢复前：${escapeHtml(task.recovery_source_status)}`);
+      recoveryMeta.push(`阶段：${escapeHtml(phaseLabel)}`);
+      const recoveryLine = recoveryBadges.length || task.recovery_source_status
+        ? `<div class="object-subline task-state-line">${recoveryBadges.join('')}<span>${recoveryMeta.join(' · ')}</span></div>`
+        : `<div class="object-subline task-state-line"><span>阶段：${escapeHtml(phaseLabel)}</span></div>`;
+      const retryMeta = [];
+      if (task.is_retrying) {
+        retryMeta.push(escapeHtml(task.retry_label || '后台重试中'));
+      } else if (Number(task.retry_count || 0) > 0) {
+        retryMeta.push(`已重试 ${escapeHtml(String(task.retry_count))} 次`);
+      }
+      if (task.last_error) {
+        retryMeta.push(`最后失败原因：${escapeHtml(task.last_error)}`);
+      }
+      const retryLine = retryMeta.length
+        ? `<div class="object-subline task-state-line task-retry-line"><span>${retryMeta.join(' · ')}</span></div>`
+        : '';
+      const errorLabel = task.error && !task.last_error ? `<div class="muted task-error-text">${escapeHtml(task.error)}</div>` : '';
+      return `
+        <article class="object-card object-card-unified object-row-card">
+          <div class="object-row-shell">
+            <div class="object-row-main">
+              <div class="object-main">
+                <div class="object-name">${escapeHtml(task.object_name)}</div>
+                <div class="object-subline">
+                  <span>${escapeHtml(task.strategy)}</span>
+                  <span class="dot-sep">•</span>
+                  <span>${escapeHtml(statusLabel)}</span>
+                  <span class="dot-sep">•</span>
+                  <span>${fmtTime(task.updated_at)}</span>
+                </div>
+                ${recoveryLine}
+                ${retryLine}
+                <div class="upload-progress-track" style="margin-top:8px;"><div class="upload-progress-bar" style="width:${percent}%;"></div></div>
+                <div class="object-subline">
+                  <span>${percent}%</span>
+                  <span class="dot-sep">•</span>
+                  <span>${fmtBytes(task.uploaded_bytes || 0)} / ${fmtBytes(task.total_size || 0)}</span>
+                  <span>${partsLabel}</span>
+                </div>
+                ${errorLabel}
+              </div>
+            </div>
+          </div>
+        </article>`;
+    }).join('');
+  };
+
+  const renderBreadcrumbs = (breadcrumbs = []) => {
+    if (!breadcrumbBox) return;
+    const safeBreadcrumbs = Array.isArray(breadcrumbs) && breadcrumbs.length > 0
+      ? breadcrumbs
+      : [{ name: 'Bucket 根目录', prefix: '', is_current: true }];
+    breadcrumbBox.innerHTML = safeBreadcrumbs.map((crumb, index) => {
+      const separator = index > 0 ? '<span class="breadcrumb-separator" aria-hidden="true">/</span>' : '';
+      if (crumb.is_current) {
+        return `${separator}<span class="breadcrumb-item is-current">${escapeHtml(crumb.name || '')}</span>`;
+      }
+      return `${separator}<a class="breadcrumb-item" href="/?prefix=${encodeURIComponent(crumb.prefix || '')}">${escapeHtml(crumb.name || '')}</a>`;
+    }).join('');
+  };
+
+  const updateCurrentDirectoryHint = (label) => {
+    if (!currentDirectoryLabel) return;
+    currentDirectoryLabel.innerHTML = `<code>${escapeHtml(label || '/')}</code>`;
+  };
+
+  const refreshFilePanel = async () => {
+    if (!objectList) return;
+    try {
+      const result = await jsonFetch(`/api/files?prefix=${encodeURIComponent(currentPrefix())}`);
+      const rows = [];
+      (result.folders || []).forEach((folder) => rows.push(buildFolderRow(folder).outerHTML));
+      (result.files || []).forEach((file) => rows.push(buildFileRow(file).outerHTML));
+      objectList.innerHTML = rows.join('') || '<div class="empty-state">这里还没有对象，或者当前前缀下没有结果。</div>';
+      renderBreadcrumbs(result.breadcrumbs || []);
+      updateCurrentDirectoryHint(result.current_directory_label || result.prefix || '/');
+      bindRowActions(objectList);
+      syncBatchDeleteToolbar();
+      updateObjectCount();
+      hideDeleteFeedback();
+    } catch (error) {
+      showDeleteFeedback(`刷新列表失败：${error.message || error}`, 'error');
+    }
+  };
+
+  const stopPolling = () => {
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+  };
+
+  const loadTaskOnce = async (taskId) => {
+    if (!taskId) return null;
+    try {
+      return await jsonFetch(`/api/server-uploads/tasks/${encodeURIComponent(taskId)}`);
+    } catch (_) {
+      return null;
+    }
+  };
+
+  const stageFileToServer = async (file, overwrite = false) => {
+    const relativeName = `${currentPrefix()}${file.name}`;
+    const fingerprint = fileFingerprint(file);
+    const init = await jsonFetch('/api/server-uploads/init', {
+      method: 'POST',
+      body: JSON.stringify({ filename: relativeName, file_size: file.size, content_type: file.type || 'application/octet-stream', file_fingerprint: `${currentPrefix()}::${fingerprint}`, overwrite }),
+    });
+
+    const totalChunks = Math.max(1, Math.ceil(file.size / PROXY_CHUNK_SIZE));
+    const uploadedSet = new Set(Array.isArray(init.uploaded_chunks) ? init.uploaded_chunks : []);
+    saveResumeState({ temp_upload_id: init.temp_upload_id, filename: relativeName, file_size: file.size, content_type: file.type || 'application/octet-stream', file_fingerprint: `${currentPrefix()}::${fingerprint}`, total_chunks: totalChunks });
+    if (init.reused && uploadedSet.size > 0) showResumeBanner(`已恢复上传会话：已存在 ${uploadedSet.size}/${totalChunks} 个分块，继续补传缺失部分。`);
+
+    currentAbortController = new AbortController();
+    let effectiveLoaded = 0;
+    for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex += 1) {
+      const start = chunkIndex * PROXY_CHUNK_SIZE;
+      const end = Math.min(start + PROXY_CHUNK_SIZE, file.size);
+      if (uploadedSet.has(chunkIndex)) {
+        effectiveLoaded += (end - start);
+        updateProgress({ loaded: effectiveLoaded, total: file.size, strategy: init.strategy, detail: `浏览器 → 服务器：已跳过已存在分块 ${chunkIndex + 1}/${totalChunks} · ${fmtBytes(effectiveLoaded)} / ${fmtBytes(file.size)}`, etaText: '恢复上传中', speedText: '恢复会话中' });
+        continue;
+      }
+      const blob = file.slice(start, end);
+      const digestBuffer = await crypto.subtle.digest('SHA-256', await blob.arrayBuffer());
+      const chunkSha256 = Array.from(new Uint8Array(digestBuffer)).map((v) => v.toString(16).padStart(2, '0')).join('');
+      await fetch(`${init.upload_url}?chunk_index=${chunkIndex}&chunk_sha256=${encodeURIComponent(chunkSha256)}`, { method: 'PUT', body: blob, credentials: 'same-origin', signal: currentAbortController.signal, headers: {'Content-Type': 'application/octet-stream'} }).then(async (response) => {
+        if (!response.ok) {
+          const payload = await response.text();
+          throw new Error(payload || `暂存分片失败：HTTP ${response.status}`);
+        }
+      });
+      effectiveLoaded += (end - start);
+      updateProgress({ loaded: effectiveLoaded, total: file.size, strategy: init.strategy, detail: `浏览器 → 服务器：第 ${chunkIndex + 1}/${totalChunks} 段已完成 · ${fmtBytes(effectiveLoaded)} / ${fmtBytes(file.size)}`, etaText: init.reused ? '恢复上传中' : undefined });
+    }
+
+    return jsonFetch(`/api/server-uploads/commit?temp_upload_id=${encodeURIComponent(init.temp_upload_id)}`, { method: 'POST', body: JSON.stringify({ filename: relativeName, file_size: file.size, content_type: file.type || 'application/octet-stream', overwrite }) });
+  };
+
+  fileInput.addEventListener('change', async () => {
     const file = fileInput.files && fileInput.files[0];
-    filePickerHint.textContent = file ? `${file.name}（${fmtBytes(file.size)}）` : '点击选择要上传的对象';
-    hideSuccess();
+    filePickerHint.textContent = file ? `${currentPrefix()}${file.name}（${fmtBytes(file.size)}）` : '点击选择要上传的对象';
+    hideSuccess(); hideResumeBanner();
+    if (!file) return;
+    const resume = loadResumeState();
+    if (!resume) return;
+    if (resume.file_fingerprint !== `${currentPrefix()}::${fileFingerprint(file)}`) return;
+    if (!resume.temp_upload_id) return;
+    try {
+      const status = await jsonFetch(`/api/server-uploads/staging/${encodeURIComponent(resume.temp_upload_id)}`);
+      if (status.committed) { clearResumeState(); return; }
+      const uploadedCount = Array.isArray(status.uploaded_chunks) ? status.uploaded_chunks.length : 0;
+      if (uploadedCount > 0) showResumeBanner(`检测到可恢复上传：${currentPrefix()}${file.name}，已上传 ${uploadedCount}/${status.total_chunks} 个分块。重新点击“上传到 Bucket”即可继续。`);
+    } catch (_) {}
   });
 
   cancelBtn.addEventListener('click', async () => {
-    currentAbort = true;
-    for (const controller of Array.from(activeControllers)) {
-      try {
-        controller.abort();
-      } catch (_) {}
-    }
-    activeControllers.clear();
-    if (currentUploadId) {
-      try {
-        await fetch(`/api/uploads/${currentUploadId}`, {method: 'DELETE', credentials: 'same-origin'});
-      } catch (_) {}
-    }
+    if (currentAbortController) currentAbortController.abort();
+    if (currentTaskId) { try { await fetch(`/api/server-uploads/tasks/${encodeURIComponent(currentTaskId)}`, {method: 'DELETE', credentials: 'same-origin'}); } catch (_) {} }
+    stopPolling();
     detailEl.textContent = '上传已取消';
-    etaEl.textContent = 'ETA --';
+    etaEl.textContent = '已停止';
     strategyEl.textContent = '策略：已取消';
     setIdle();
   });
@@ -900,70 +785,77 @@
     });
   }
 
-  if (batchDeleteSelectAll) {
-    batchDeleteSelectAll.addEventListener('click', () => {
-      getSelectBoxes().forEach((input) => {
-        if (!input.disabled) input.checked = true;
-      });
-      hideDeleteFeedback();
-      syncBatchDeleteToolbar();
+  if (batchDeleteSelectAll) batchDeleteSelectAll.addEventListener('click', () => { getSelectBoxes().forEach((input) => { if (!input.disabled) input.checked = true; }); hideDeleteFeedback(); syncBatchDeleteToolbar(); });
+  if (batchDeleteClear) batchDeleteClear.addEventListener('click', () => { getSelectBoxes().forEach((input) => { if (!input.disabled) input.checked = false; }); hideDeleteFeedback(); syncBatchDeleteToolbar(); });
+
+  const triggerBatchDownload = () => {
+    const selected = getSelectedObjectNames();
+    if (selected.length === 0 || !batchDownloadForm || !batchDownloadHiddenInputs) return;
+    hideSuccess(); hideDeleteFeedback();
+    const prefixInput = batchDownloadForm.querySelector('input[name="prefix"]');
+    if (prefixInput) prefixInput.value = currentPrefix();
+    batchDownloadHiddenInputs.innerHTML = '';
+    selected.forEach((objectName) => {
+      const input = document.createElement('input');
+      input.type = 'hidden'; input.name = 'object_names'; input.value = objectName;
+      batchDownloadHiddenInputs.appendChild(input);
     });
-  }
+    try { batchDownloadForm.submit(); showDeleteFeedback('✅ 已提交批量下载。', 'success'); } catch (error) { showDeleteFeedback(`批量下载失败：${error.message || error}`, 'error'); }
+  };
 
-  if (batchDeleteClear) {
-    batchDeleteClear.addEventListener('click', () => {
-      getSelectBoxes().forEach((input) => {
-        if (!input.disabled) input.checked = false;
-      });
-      hideDeleteFeedback();
+  const handleBatchDelete = async () => {
+    const selected = getSelectedObjectNames();
+    if (selected.length === 0) return;
+    if (!window.confirm(`确认批量删除已选中的 ${selected.length} 个对象吗？删除后不可恢复。`)) return;
+    try {
+      const result = await jsonFetch('/objects/batch-delete', { method: 'POST', body: JSON.stringify({object_names: selected}) });
+      removeObjectRows(Array.isArray(result.deleted) ? result.deleted : []);
+      showDeleteFeedback(`✅ ${result.message || '批量删除成功'}`, 'success');
+    } catch (error) {
+      const payload = error && error.payload ? error.payload : null;
+      if (payload && Array.isArray(payload.deleted)) removeObjectRows(payload.deleted);
+      showDeleteFeedback(`删除失败：${error.message || error}`, 'error');
+    } finally {
       syncBatchDeleteToolbar();
-    });
-  }
+      updateObjectCount();
+    }
+  };
 
-  if (batchDownloadButton) {
-    batchDownloadButton.addEventListener('click', triggerBatchDownload);
-  }
-
-  if (batchDeleteButton) {
-    batchDeleteButton.addEventListener('click', handleBatchDelete);
-  }
-
-  deleteButtons.forEach((button) => {
-    button.addEventListener('click', async () => {
-      const objectName = button.dataset.objectName || '';
-      if (!objectName) return;
-      const objectRow = button.closest('[data-object-row]');
-      const ok = window.confirm(`确认删除对象「${objectName}」吗？删除后不可恢复。`);
-      if (!ok) return;
-      hideSuccess();
-      hideDeleteFeedback();
-      button.disabled = true;
-      const originText = button.textContent;
-      button.textContent = '删除中...';
-      if (objectRow) objectRow.classList.add('object-card-pending-delete');
-      try {
-        const result = await jsonFetch(`/objects/${encodeURIComponent(objectName).replace(/%2F/g, '/')}`, {method: 'DELETE'});
-        if (objectRow) {
-          objectRow.classList.add('object-card-deleting');
-          window.setTimeout(() => {
-            objectRow.remove();
-            updateObjectCount();
-            ensureEmptyState();
-            syncBatchDeleteToolbar();
-          }, 220);
+  if (batchDownloadButton) batchDownloadButton.addEventListener('click', triggerBatchDownload);
+  if (batchDeleteButton) batchDeleteButton.addEventListener('click', handleBatchDelete);
+  if (refreshFilePanelBtn) refreshFilePanelBtn.addEventListener('click', refreshFilePanel);
+  if (createFolderButton) createFolderButton.addEventListener('click', () => { if (newFolderInput) newFolderInput.focus(); });
+  if (createFolderSubmit) createFolderSubmit.addEventListener('click', async () => {
+    const folderName = newFolderInput?.value?.trim() || '';
+    if (!folderName) { showDeleteFeedback('请先输入文件夹名。', 'error'); return; }
+    try {
+      hideConflictFeedback();
+      const result = await jsonFetch('/api/files/folders', { method: 'POST', body: JSON.stringify({ prefix: currentPrefix(), folder_name: folderName }) });
+      if (newFolderInput) newFolderInput.value = '';
+      showDeleteFeedback(`✅ ${result.message || '目录创建成功'}`, 'success');
+      await refreshFilePanel();
+    } catch (error) {
+      if (isConflictError(error)) {
+        const message = buildConflictMessage(error.payload);
+        showConflictFeedback(`⚠️ ${message}`);
+        if (window.confirm(`${message}\n\n确认仍要覆盖/继续吗？`)) {
+          try {
+            const result = await jsonFetch('/api/files/folders', { method: 'POST', body: JSON.stringify({ prefix: currentPrefix(), folder_name: folderName, overwrite: true }) });
+            if (newFolderInput) newFolderInput.value = '';
+            hideConflictFeedback();
+            showDeleteFeedback(`✅ ${result.message || '目录创建成功'}`, 'success');
+            await refreshFilePanel();
+            return;
+          } catch (retryError) {
+            showDeleteFeedback(`创建目录失败：${retryError.message || retryError}`, 'error');
+            return;
+          }
         }
-        const detailMessage = result.detail || `对象“${objectName}”已从当前列表移除。`;
-        showDeleteFeedback(`✅ 删除成功：${detailMessage}`, 'success');
-      } catch (error) {
-        if (objectRow) objectRow.classList.remove('object-card-pending-delete');
-        showDeleteFeedback(`删除失败：${error.message || error}`, 'error');
-      } finally {
-        button.disabled = false;
-        button.textContent = originText;
+        return;
       }
-    });
+      showDeleteFeedback(`创建目录失败：${error.message || error}`, 'error');
+    }
   });
-
 
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
@@ -974,32 +866,92 @@
       etaEl.textContent = 'ETA --';
       return;
     }
-
-    hideSuccess();
-    hideDeleteFeedback();
-    showStatus();
-    setBusy();
-    currentAbort = false;
-    currentUploadId = null;
-    detailEl.textContent = '正在准备上传...';
+    hideSuccess(); hideDeleteFeedback(); hideResumeBanner(); hideConflictFeedback(); showStatus(); setBusy(); stopPolling();
+    currentTaskId = null;
+    detailEl.textContent = '正在准备浏览器 → 服务器上传…';
+    etaEl.textContent = '准备中';
+    strategyEl.textContent = '策略：浏览器上传到服务器，再由服务端上传 OCI';
     barEl.style.width = '0%';
 
     try {
-      const result = file.size <= MULTIPART_THRESHOLD ? await uploadSingle(file) : await uploadMultipart(file);
-      const message = result.message || `上传成功：${result.object_name || file.name}`;
-      showSuccess(`✅ ${message}`);
-      detailEl.textContent = '上传完成，正在刷新列表...';
+      const commit = await stageFileToServer(file);
+      currentTaskId = commit.task_id;
+      clearResumeState();
+      hideResumeBanner();
+      updateProgress({
+        loaded: file.size,
+        total: file.size,
+        strategy: commit.strategy,
+        detail: '已上传到服务器，正在后台入桶。可直接继续操作，最终结果请看“上传任务”。',
+        etaText: '后台处理中',
+        speedText: '浏览器上传阶段已完成',
+      });
+      showSuccess(`✅ 已上传到服务器：${commit.object_name}`);
+      showDeleteFeedback('✅ 前台上传已完成，后台入桶任务已创建。可在“上传任务”里查看结果。', 'success');
       setIdle();
-      setTimeout(() => window.location.reload(), 900);
+      const latestTask = await loadTaskOnce(commit.task_id);
+      if (latestTask) {
+        renderTasks([latestTask]);
+      } else {
+        await refreshTasks();
+      }
+      currentTaskId = null;
+      scheduleTaskRefresh(1200);
     } catch (error) {
+      if (isConflictError(error)) {
+        const message = buildConflictMessage(error.payload);
+        showConflictFeedback(`⚠️ ${message}`);
+        detailEl.textContent = `上传已暂停：${message}`;
+        etaEl.textContent = '等待确认';
+        setIdle();
+        if (window.confirm(`${message}\n\n确认覆盖并继续上传吗？`)) {
+          try {
+            hideConflictFeedback();
+            setBusy();
+            const commit = await stageFileToServer(file, true);
+            currentTaskId = commit.task_id;
+            clearResumeState();
+            hideResumeBanner();
+            updateProgress({
+              loaded: file.size,
+              total: file.size,
+              strategy: commit.strategy,
+              detail: '已上传到服务器，正在后台覆盖入桶。可直接继续操作，最终结果请看“上传任务”。',
+              etaText: '后台处理中',
+              speedText: '浏览器上传阶段已完成',
+            });
+            showSuccess(`✅ 已上传到服务器：${commit.object_name}`);
+            showDeleteFeedback('✅ 前台上传已完成，后台入桶任务已创建。可在“上传任务”里查看结果。', 'success');
+            setIdle();
+            const latestTask = await loadTaskOnce(commit.task_id);
+            if (latestTask) {
+              renderTasks([latestTask]);
+            } else {
+              await refreshTasks();
+            }
+            currentTaskId = null;
+            scheduleTaskRefresh(1200);
+            return;
+          } catch (retryError) {
+            detailEl.textContent = `上传失败：${retryError.message || retryError}`;
+            etaEl.textContent = '已停止';
+            setIdle();
+            return;
+          }
+        }
+        return;
+      }
       detailEl.textContent = `上传失败：${error.message || error}`;
-      etaEl.textContent = 'ETA --';
-      strategyEl.textContent = currentAbort ? '策略：已取消' : strategyEl.textContent;
+      etaEl.textContent = '已停止';
       setIdle();
     }
   });
 
+  if (refreshTaskBtn) refreshTaskBtn.addEventListener('click', refreshTasks);
+  bindRowActions(document);
   syncBatchDeleteToolbar();
+  updateObjectCount();
+  refreshTasks();
 })();
 </script>
 {% endblock %}

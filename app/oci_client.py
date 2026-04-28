@@ -161,14 +161,22 @@ class OCIStorageService:
     def upload_file(self, object_name: str, fileobj: BinaryIO, content_type: str | None = None) -> None:
         content_type = guess_content_type(object_name, content_type)
         try:
+            content_length = None
             if hasattr(fileobj, "seek"):
                 fileobj.seek(0)
+                if hasattr(fileobj, "tell"):
+                    start_pos = fileobj.tell()
+                    fileobj.seek(0, 2)
+                    end_pos = fileobj.tell()
+                    content_length = max(0, end_pos - start_pos)
+                    fileobj.seek(start_pos)
             self.client.put_object(
                 self.namespace,
                 self.bucket_name,
                 object_name,
                 fileobj,
                 content_type=content_type,
+                content_length=content_length,
             )
         except ServiceError as exc:
             raise OCIStorageError(f"上传失败: {exc.message}") from exc

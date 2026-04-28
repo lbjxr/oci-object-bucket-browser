@@ -5,6 +5,118 @@ from fastapi.testclient import TestClient
 from oci.exceptions import ServiceError
 
 
+class DummyManagerTask:
+    def __init__(self, task_id='task-1', object_name='big.bin', strategy='oci-multipart-server-proxy'):
+        self.task_id = task_id
+        self.object_name = object_name
+        self.filename = object_name
+        self.content_type = 'application/octet-stream'
+        self.total_size = 20 * 1024 * 1024
+        self.strategy = strategy
+        self.status = 'queued'
+        self.phase = 'waiting'
+        self.created_at = '2026-04-24T12:00:00+00:00'
+        self.updated_at = self.created_at
+        self.temp_path = '/tmp/fake-upload.bin'
+        self.upload_session_id = 'upload-session-1'
+        self.multipart_upload_id = 'mp-1'
+        self.uploaded_bytes = 0
+        self.uploaded_parts = []
+        self.total_parts = 3
+        self.parallelism = 3
+        self.error = None
+
+    def to_dict(self):
+        return self.__dict__.copy()
+
+    def to_api_dict(self):
+        payload = self.to_dict()
+        retrying = self.phase.startswith('retrying_')
+        retry_count = 0
+        retry_attempt = 0
+        retry_max_attempts = 0
+        retry_kind = None
+        retry_part_num = None
+        retry_label = None
+        if self.phase.startswith('retrying_single_put:'):
+            retry_kind = 'single_put'
+            progress = self.phase.split(':', 1)[1]
+            retry_attempt, retry_max_attempts = [int(x) for x in progress.split('/', 1)]
+            retry_count = retry_attempt
+            retry_label = f'后台重试中（第 {retry_attempt} 次，共 {retry_max_attempts} 次）'
+        elif self.phase.startswith('retrying_part:') and '（第' in self.phase and '次重试）' in self.phase:
+            retry_kind = 'part'
+            progress = self.phase.split(':', 1)[1]
+            part_text, attempt_text = progress.split('（第', 1)
+            retry_part_num = int(part_text.strip())
+            retry_attempt = int(attempt_text.split('次重试）', 1)[0])
+            retry_max_attempts = 3
+            retry_count = retry_attempt
+            retry_label = f'后台重试中（分片 {retry_part_num}，第 {retry_attempt} 次）'
+        payload.update({
+            'current_phase': self.phase,
+            'phase_label': '等待执行' if self.phase == 'waiting' else self.phase,
+            'recovered': self.phase.startswith('recovery_'),
+            'recovery_attempted': self.phase.startswith('recovery_') or bool(self.error and '恢复' in self.error),
+            'recovery_source_status': self.phase.split(':', 1)[1] if self.phase.startswith('recovery_requeued_from:') else None,
+            'recovery_problem': 'missing_temp_file' if self.phase == 'recovery_missing_temp_file' else None,
+            'status_label': {
+                'queued': '排队中',
+                'running': '执行中',
+                'finalizing': '收尾中',
+                'completed': '已完成',
+                'failed': '失败',
+                'canceled': '已取消',
+            }.get(self.status, self.status),
+            'is_retrying': retrying,
+            'retry_count': retry_count,
+            'retry_attempt': retry_attempt,
+            'retry_max_attempts': retry_max_attempts,
+            'retry_kind': retry_kind,
+            'retry_part_num': retry_part_num,
+            'retry_label': retry_label,
+            'last_error': self.error,
+        })
+        return payload
+
+
+class DummyTaskStore:
+    def __init__(self, task):
+        self.task = task
+
+    def list_recent(self, limit=20):
+        return [self.task][:limit]
+
+    def get(self, task_id):
+        return self.task if self.task and self.task.task_id == task_id else None
+
+
+class DummyUploadTaskManager:
+    def __init__(self):
+        self.created = []
+        self.temp_root = Path('/tmp/server-upload-tests')
+        self.temp_root.mkdir(parents=True, exist_ok=True)
+        self.task = DummyManagerTask()
+        self.task_store = DummyTaskStore(self.task)
+
+    def temp_path_for(self, task_hint, filename):
+        return self.temp_root / f'{task_hint}-{filename}'
+
+    def create_task_from_staged_file(self, *, filename, content_type, staged_path, total_size):
+        self.created.append((filename, content_type, staged_path, total_size))
+        self.task.filename = filename
+        self.task.object_name = filename
+        self.task.total_size = total_size
+        self.task.temp_path = staged_path
+        return self.task
+
+    def cancel(self, task_id):
+        if self.task and self.task.task_id == task_id:
+            self.task.status = 'canceled'
+            return self.task
+        return None
+
+
 def make_client(tmp_path: Path):
     import app.routes as routes
     from app.config import get_settings
@@ -15,6 +127,7 @@ def make_client(tmp_path: Path):
     os.environ['APP_AUTH_PASSWORD'] = 'test-password-for-smoke'
     os.environ['APP_SESSION_SECRET'] = 'test-session-secret-for-smoke'
     os.environ['APP_UPLOAD_SESSION_DIR'] = str(tmp_path / 'upload-sessions')
+    os.environ['APP_UPLOAD_TEMP_DIR'] = str(tmp_path / 'upload-staging')
     os.environ['APP_UPLOAD_CHUNK_SIZE_MB'] = '8'
     os.environ['APP_UPLOAD_SINGLE_PUT_THRESHOLD_MB'] = '4'
     os.environ['APP_UPLOAD_PARALLELISM'] = '3'
@@ -32,9 +145,19 @@ def make_client(tmp_path: Path):
             self.fail_parts = {}
             self.fail_part_errors = {}
             self.deleted_objects = []
+            self.object_entries = []
 
         def upload_file(self, object_name, fileobj, content_type=None):
-            self.single_uploads.append((object_name, fileobj.read(), content_type))
+            payload = fileobj.read()
+            self.single_uploads.append((object_name, payload, content_type))
+            self.object_entries = [entry for entry in self.object_entries if entry.name != object_name]
+            self.object_entries.append(type('Obj', (), {
+                'name': object_name,
+                'size': len(payload),
+                'etag': f'etag-{object_name}',
+                'time_created': '2026-04-24T12:00:00+00:00',
+                'content_type': content_type or 'application/octet-stream',
+            })())
 
         def create_multipart_upload(self, object_name, content_type=None):
             upload_id = f'mp-{len(self.multipart_created)+1}'
@@ -72,9 +195,12 @@ def make_client(tmp_path: Path):
             if callable(getattr(self, 'delete_hook', None)):
                 return self.delete_hook(object_name)
             self.deleted_objects.append(object_name)
+            self.object_entries = [entry for entry in self.object_entries if entry.name != object_name]
 
         def list_objects(self, prefix=''):
-            return []
+            if not prefix:
+                return list(self.object_entries)
+            return [entry for entry in self.object_entries if entry.name.startswith(prefix)]
 
         def head_object(self, object_name):
             from app.models import ObjectDownloadInfo
@@ -109,14 +235,43 @@ def make_client(tmp_path: Path):
             raise AssertionError('not used in this test')
 
     fake_storage = FakeStorage()
+    dummy_manager = DummyUploadTaskManager()
     routes.get_storage = lambda: fake_storage
+    routes.get_upload_task_manager = lambda: dummy_manager
     client = TestClient(create_app())
     client.post('/login', data={'username': 'test-admin', 'password': 'test-password-for-smoke', 'next_path': '/'})
-    return client, fake_storage
+    return client, fake_storage, dummy_manager
+
+
+def test_app_lifespan_starts_and_stops_cleanup_scheduler(tmp_path):
+    import app.routes as routes
+    from app.config import get_settings
+    from app.main import create_app
+
+    import os
+    os.environ['APP_AUTH_USERNAME'] = 'test-admin'
+    os.environ['APP_AUTH_PASSWORD'] = 'test-password-for-smoke'
+    os.environ['APP_SESSION_SECRET'] = 'test-session-secret-for-smoke'
+    os.environ['APP_UPLOAD_SESSION_DIR'] = str(tmp_path / 'upload-sessions')
+    os.environ['APP_UPLOAD_TASK_DIR'] = str(tmp_path / 'upload-tasks')
+    os.environ['APP_UPLOAD_TEMP_DIR'] = str(tmp_path / 'upload-staging')
+    os.environ['APP_UPLOAD_CLEANUP_ENABLED'] = 'true'
+    os.environ['APP_UPLOAD_CLEANUP_SCHEDULER_ENABLED'] = 'true'
+    os.environ['APP_UPLOAD_CLEANUP_INTERVAL_SECONDS'] = '60'
+    get_settings.cache_clear()
+
+    routes.get_storage = lambda: type('FakeStorage', (), {'list_objects': lambda self, prefix='': []})()
+    routes.get_upload_task_manager = lambda: DummyUploadTaskManager()
+
+    with TestClient(create_app()) as client:
+        scheduler = client.app.state.upload_cleanup_scheduler
+        assert scheduler.is_running() is True
+
+    assert scheduler.is_running() is False
 
 
 def test_small_file_upload_still_uses_single_put(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     response = client.post(
         '/upload',
         files={'file': ('tiny.txt', b'hello world', 'text/plain')},
@@ -130,7 +285,7 @@ def test_small_file_upload_still_uses_single_put(tmp_path):
 
 
 def test_init_upload_session_returns_parallelism_and_strategy(tmp_path):
-    client, _ = make_client(tmp_path)
+    client, _, _ = make_client(tmp_path)
     init = client.post(
         '/api/uploads/init',
         json={
@@ -149,9 +304,8 @@ def test_init_upload_session_returns_parallelism_and_strategy(tmp_path):
     assert payload['uploaded_parts'] == []
     assert payload['uploaded_bytes'] == 0
 
-
-def test_index_includes_dynamic_throttle_concurrency_copy(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+def test_index_includes_server_proxy_upload_copy(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
 
     class _Object:
         def __init__(self):
@@ -166,11 +320,257 @@ def test_index_includes_dynamic_throttle_concurrency_copy(tmp_path):
     response = client.get('/')
     assert response.status_code == 200
     html = response.text
-    assert 'THROTTLE_STREAK_REDUCE_THRESHOLD = 2' in html
-    assert '限流收敛至 ${targetConcurrency}/${parallelism} 路' in html
-    assert '已临时下调上传并发到 ${targetConcurrency}/${parallelism} 路' in html
+    assert '浏览器先把文件传到本服务；再由服务端异步上传到 OCI' in html
+    assert 'upload-task-list' in html
+    assert '/api/server-uploads/init' in html
+    assert '/api/server-uploads/tasks' in html
+    assert '正在上传到服务器…' in html
+    assert '浏览器上传阶段已完成' in html
+
+
+
+def test_index_includes_dynamic_throttle_concurrency_copy(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
+
+    class _Object:
+        def __init__(self):
+            self.name = 'docs/a.txt'
+            self.size = 12
+            self.etag = 'etag-a'
+            self.time_created = '2026-04-22T10:00:00+00:00'
+            self.content_type = 'text/plain'
+
+    fake_storage.list_objects = lambda prefix='': [_Object()]
+
+    response = client.get('/')
+    assert response.status_code == 200
+    html = response.text
+    assert '浏览器先把文件传到本服务；再由服务端异步上传到 OCI' in html
+    assert 'upload-task-list' in html
+    assert '/api/server-uploads/init' in html
+    assert '/api/server-uploads/tasks' in html
+    assert '正在上传到服务器…' in html
+    assert '浏览器上传阶段已完成' in html
     assert '下载所选' in html
     assert '/objects/batch-download' in html
+
+
+
+def test_index_shows_file_manager_panel_and_folder_actions(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
+
+    fake_storage.object_entries = [
+        type('Obj', (), {
+            'name': 'docs/',
+            'size': 0,
+            'etag': 'etag-docs',
+            'time_created': '2026-04-22T10:00:00+00:00',
+            'content_type': 'application/x-directory',
+        })(),
+        type('Obj', (), {
+            'name': 'docs/a.txt',
+            'size': 12,
+            'etag': 'etag-a',
+            'time_created': '2026-04-22T10:00:00+00:00',
+            'content_type': 'text/plain',
+        })(),
+    ]
+
+    response = client.get('/')
+    assert response.status_code == 200
+    html = response.text
+    assert '文件管理' in html
+    assert '新建文件夹' in html
+    assert '返回上级' not in html
+    assert 'Bucket 根目录' in html
+    assert '当前目录' in html
+    assert '上传 / 新建文件夹 / 重命名默认作用在这里。' in html
+    assert '📁 docs/' in html
+    assert '重命名' in html
+    assert '删除目录' in html
+
+
+
+def test_index_shows_breadcrumbs_for_nested_prefix(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
+    fake_storage.object_entries = [
+        type('Obj', (), {
+            'name': 'docs/2026/report.txt',
+            'size': 12,
+            'etag': 'etag-report',
+            'time_created': '2026-04-22T10:00:00+00:00',
+            'content_type': 'text/plain',
+        })(),
+    ]
+
+    response = client.get('/?prefix=docs/2026/')
+    assert response.status_code == 200
+    html = response.text
+    assert '返回上级' in html
+    assert 'Bucket 根目录' in html
+    assert 'docs' in html
+    assert '2026' in html
+    assert '<code>docs/2026/</code>' in html
+
+
+
+def test_list_files_api_returns_folder_and_file_split(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
+    fake_storage.object_entries = [
+        type('Obj', (), {'name': 'docs/', 'size': 0, 'etag': 'etag-docs', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'application/x-directory'})(),
+        type('Obj', (), {'name': 'docs/a.txt', 'size': 12, 'etag': 'etag-a', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'text/plain'})(),
+        type('Obj', (), {'name': 'docs/sub/b.txt', 'size': 18, 'etag': 'etag-b', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'text/plain'})(),
+    ]
+
+    response = client.get('/api/files?prefix=docs/')
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['prefix'] == 'docs/'
+    assert payload['current_directory_label'] == 'docs/'
+    assert payload['parent_prefix'] == ''
+    assert [item['name'] for item in payload['breadcrumbs']] == ['Bucket 根目录', 'docs']
+    assert [item['name'] for item in payload['folders']] == ['sub']
+    assert [item['name'] for item in payload['files']] == ['docs/a.txt']
+
+
+
+def test_create_folder_creates_placeholder_object(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
+    response = client.post('/api/files/folders', json={'prefix': 'docs/', 'folder_name': 'new-folder'})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['path'] == 'docs/new-folder/'
+    assert fake_storage.single_uploads[-1][0] == 'docs/new-folder/'
+    assert fake_storage.single_uploads[-1][1] == b''
+
+
+
+def test_create_folder_rejects_conflicting_prefix_without_overwrite(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
+    fake_storage.object_entries = [
+        type('Obj', (), {'name': 'docs/new-folder/', 'size': 0, 'etag': 'etag-docs', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'application/x-directory'})(),
+        type('Obj', (), {'name': 'docs/new-folder/a.txt', 'size': 12, 'etag': 'etag-a', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'text/plain'})(),
+    ]
+    response = client.post('/api/files/folders', json={'prefix': 'docs/', 'folder_name': 'new-folder'})
+    assert response.status_code == 409
+    payload = response.json()
+    assert payload['conflict']['action'] == 'create_folder'
+    assert payload['conflict']['destination_path'] == 'docs/new-folder/'
+
+
+
+def test_create_folder_allows_overwrite_after_confirmation(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
+    fake_storage.object_entries = [
+        type('Obj', (), {'name': 'docs/new-folder/', 'size': 0, 'etag': 'etag-docs', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'application/x-directory'})(),
+    ]
+    response = client.post('/api/files/folders', json={'prefix': 'docs/', 'folder_name': 'new-folder', 'overwrite': True})
+    assert response.status_code == 200
+    assert response.json()['overwritten'] is True
+    assert fake_storage.single_uploads[-1][0] == 'docs/new-folder/'
+
+
+
+def test_rename_file_copies_then_deletes(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
+    fake_storage.download_payloads = {'docs/a.txt': b'hello-a'}
+    fake_storage.object_entries = [
+        type('Obj', (), {'name': 'docs/a.txt', 'size': 7, 'etag': 'etag-a', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'text/plain'})(),
+    ]
+
+    response = client.post('/api/files/rename', json={'source_path': 'docs/a.txt', 'new_name': 'renamed.txt'})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['kind'] == 'file'
+    assert payload['destination_path'] == 'docs/renamed.txt'
+    assert fake_storage.single_uploads[-1][0] == 'docs/renamed.txt'
+    assert fake_storage.deleted_objects[-1] == 'docs/a.txt'
+
+
+
+def test_rename_file_rejects_existing_target_without_overwrite(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
+    fake_storage.object_entries = [
+        type('Obj', (), {'name': 'docs/a.txt', 'size': 7, 'etag': 'etag-a', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'text/plain'})(),
+        type('Obj', (), {'name': 'docs/renamed.txt', 'size': 8, 'etag': 'etag-b', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'text/plain'})(),
+    ]
+    response = client.post('/api/files/rename', json={'source_path': 'docs/a.txt', 'new_name': 'renamed.txt'})
+    assert response.status_code == 409
+    payload = response.json()
+    assert payload['conflict']['kind'] == 'file'
+    assert payload['conflict']['destination_path'] == 'docs/renamed.txt'
+
+
+
+def test_rename_file_allows_overwrite_after_confirmation(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
+    fake_storage.download_payloads = {'docs/a.txt': b'hello-a'}
+    fake_storage.object_entries = [
+        type('Obj', (), {'name': 'docs/a.txt', 'size': 7, 'etag': 'etag-a', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'text/plain'})(),
+        type('Obj', (), {'name': 'docs/renamed.txt', 'size': 8, 'etag': 'etag-b', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'text/plain'})(),
+    ]
+    response = client.post('/api/files/rename', json={'source_path': 'docs/a.txt', 'new_name': 'renamed.txt', 'overwrite': True})
+    assert response.status_code == 200
+    assert response.json()['overwritten'] is True
+    assert fake_storage.single_uploads[-1][0] == 'docs/renamed.txt'
+
+
+
+def test_rename_folder_moves_all_children(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
+    fake_storage.download_payloads = {
+        'docs/': b'',
+        'docs/a.txt': b'hello-a',
+        'docs/sub/b.txt': b'hello-b',
+    }
+    fake_storage.object_entries = [
+        type('Obj', (), {'name': 'docs/', 'size': 0, 'etag': 'etag-docs', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'application/x-directory'})(),
+        type('Obj', (), {'name': 'docs/a.txt', 'size': 7, 'etag': 'etag-a', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'text/plain'})(),
+        type('Obj', (), {'name': 'docs/sub/b.txt', 'size': 7, 'etag': 'etag-b', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'text/plain'})(),
+    ]
+
+    response = client.post('/api/files/rename', json={'source_path': 'docs/', 'new_name': 'archive'})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['kind'] == 'folder'
+    assert payload['destination_path'] == 'archive/'
+    uploaded_names = [item[0] for item in fake_storage.single_uploads]
+    assert 'archive/' in uploaded_names
+    assert 'archive/a.txt' in uploaded_names
+    assert 'archive/sub/b.txt' in uploaded_names
+    assert set(fake_storage.deleted_objects) >= {'docs/', 'docs/a.txt', 'docs/sub/b.txt'}
+
+
+
+def test_rename_folder_rejects_existing_target_prefix_without_overwrite(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
+    fake_storage.object_entries = [
+        type('Obj', (), {'name': 'docs/', 'size': 0, 'etag': 'etag-docs', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'application/x-directory'})(),
+        type('Obj', (), {'name': 'docs/a.txt', 'size': 7, 'etag': 'etag-a', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'text/plain'})(),
+        type('Obj', (), {'name': 'archive/existing.txt', 'size': 7, 'etag': 'etag-b', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'text/plain'})(),
+    ]
+    response = client.post('/api/files/rename', json={'source_path': 'docs/', 'new_name': 'archive'})
+    assert response.status_code == 409
+    payload = response.json()
+    assert payload['conflict']['kind'] == 'folder'
+    assert payload['conflict']['destination_path'] == 'archive/'
+
+
+
+def test_delete_folder_deletes_all_objects_under_prefix(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
+    fake_storage.object_entries = [
+        type('Obj', (), {'name': 'docs/', 'size': 0, 'etag': 'etag-docs', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'application/x-directory'})(),
+        type('Obj', (), {'name': 'docs/a.txt', 'size': 7, 'etag': 'etag-a', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'text/plain'})(),
+        type('Obj', (), {'name': 'docs/sub/b.txt', 'size': 7, 'etag': 'etag-b', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'text/plain'})(),
+    ]
+
+    response = client.post('/api/files/delete', json={'path': 'docs/'})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload['kind'] == 'folder'
+    assert payload['deleted_count'] == 3
+    assert set(fake_storage.deleted_objects) >= {'docs/', 'docs/a.txt', 'docs/sub/b.txt'}
 
 
 
@@ -178,7 +578,7 @@ def test_batch_download_returns_zip_of_selected_objects(tmp_path):
     import io
     import zipfile
 
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     fake_storage.download_payloads = {
         'docs/a.txt': b'hello-a',
         'images/b.png': b'hello-b',
@@ -207,7 +607,7 @@ def test_batch_download_accepts_form_post_for_native_browser_download(tmp_path):
     import io
     import zipfile
 
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     fake_storage.download_payloads = {
         'docs/a.txt': b'hello-a',
         'images/b.png': b'hello-b',
@@ -238,7 +638,7 @@ def test_batch_download_skips_failed_objects_and_emits_failure_manifest(tmp_path
     import json as _json
     import zipfile
 
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     fake_storage.download_payloads = {
         'docs/a.txt': b'hello-a',
         'images/b.png': b'hello-b',
@@ -275,7 +675,7 @@ def test_batch_download_skips_failed_objects_and_emits_failure_manifest(tmp_path
 
 
 def test_batch_download_fails_when_all_objects_fail(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     fake_storage.download_payloads = {}
 
     response = client.post(
@@ -288,7 +688,7 @@ def test_batch_download_fails_when_all_objects_fail(tmp_path):
 
 
 def test_download_supports_range_requests(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     fake_storage.download_payloads = {
         'docs/a.txt': b'0123456789',
     }
@@ -304,7 +704,7 @@ def test_download_supports_range_requests(tmp_path):
 
 
 def test_download_supports_suffix_range_requests(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     fake_storage.download_payloads = {
         'docs/a.txt': b'0123456789',
     }
@@ -318,7 +718,7 @@ def test_download_supports_suffix_range_requests(tmp_path):
 
 
 def test_download_rejects_multi_range_requests(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     fake_storage.download_payloads = {
         'docs/a.txt': b'0123456789',
     }
@@ -330,7 +730,7 @@ def test_download_rejects_multi_range_requests(tmp_path):
 
 
 def test_multipart_flow_supports_resume_and_complete(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     init = client.post(
         '/api/uploads/init',
         json={
@@ -388,7 +788,7 @@ def test_multipart_flow_supports_resume_and_complete(tmp_path):
 
 
 def test_upload_part_returns_existing_etag_when_part_already_uploaded(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     init = client.post(
         '/api/uploads/init',
         json={
@@ -420,7 +820,7 @@ def test_upload_part_returns_existing_etag_when_part_already_uploaded(tmp_path):
 
 
 def test_batch_download_requires_selection(tmp_path):
-    client, _ = make_client(tmp_path)
+    client, _, _ = make_client(tmp_path)
     response = client.post('/objects/batch-download', json={'object_names': []})
     assert response.status_code == 400
     assert response.json()['detail'] == '至少要选择一个对象'
@@ -428,7 +828,7 @@ def test_batch_download_requires_selection(tmp_path):
 
 
 def test_batch_download_form_requires_selection(tmp_path):
-    client, _ = make_client(tmp_path)
+    client, _, _ = make_client(tmp_path)
     response = client.post('/objects/batch-download', data={'prefix': 'docs/'})
     assert response.status_code == 400
     assert response.json()['detail'] == '至少要选择一个对象'
@@ -436,7 +836,7 @@ def test_batch_download_form_requires_selection(tmp_path):
 
 
 def test_resume_reconciles_remote_parts_when_local_session_is_stale(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     init = client.post(
         '/api/uploads/init',
         json={
@@ -481,7 +881,7 @@ def test_resume_reconciles_remote_parts_when_local_session_is_stale(tmp_path):
 
 
 def test_resume_degrades_to_local_session_when_remote_reconcile_fails(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     init = client.post(
         '/api/uploads/init',
         json={
@@ -525,7 +925,7 @@ def test_resume_degrades_to_local_session_when_remote_reconcile_fails(tmp_path):
 
 
 def test_status_reconcile_removes_local_parts_missing_on_remote(tmp_path):
-    client, _ = make_client(tmp_path)
+    client, _, _ = make_client(tmp_path)
     init = client.post(
         '/api/uploads/init',
         json={
@@ -564,7 +964,7 @@ def test_status_reconcile_removes_local_parts_missing_on_remote(tmp_path):
 
 
 def test_complete_reconciles_remote_parts_before_commit(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     init = client.post(
         '/api/uploads/init',
         json={
@@ -591,7 +991,7 @@ def test_complete_reconciles_remote_parts_before_commit(tmp_path):
 
 
 def test_cancel_upload_aborts_multipart(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     init = client.post(
         '/api/uploads/init',
         json={
@@ -613,7 +1013,7 @@ def test_cancel_upload_aborts_multipart(tmp_path):
 
 
 def test_complete_fails_when_parts_are_missing(tmp_path):
-    client, _ = make_client(tmp_path)
+    client, _, _ = make_client(tmp_path)
     init = client.post(
         '/api/uploads/init',
         json={
@@ -637,7 +1037,7 @@ def test_complete_fails_when_parts_are_missing(tmp_path):
 
 
 def test_upload_part_failure_is_reported_without_mutating_uploaded_parts(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     init = client.post(
         '/api/uploads/init',
         json={
@@ -667,7 +1067,7 @@ def test_upload_part_failure_is_reported_without_mutating_uploaded_parts(tmp_pat
 
 
 def test_upload_part_timeout_is_marked_retryable(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     init = client.post(
         '/api/uploads/init',
         json={
@@ -693,7 +1093,7 @@ def test_upload_part_timeout_is_marked_retryable(tmp_path):
 
 
 def test_upload_part_http_5xx_is_marked_retryable(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     init = client.post(
         '/api/uploads/init',
         json={
@@ -728,7 +1128,7 @@ def test_upload_part_http_5xx_is_marked_retryable(tmp_path):
 
 
 def test_upload_part_http_4xx_stops_retry_early(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     init = client.post(
         '/api/uploads/init',
         json={
@@ -763,7 +1163,7 @@ def test_upload_part_http_4xx_stops_retry_early(tmp_path):
 
 
 def test_upload_part_http_429_is_retryable_and_returns_retry_after(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     init = client.post(
         '/api/uploads/init',
         json={
@@ -799,7 +1199,7 @@ def test_upload_part_http_429_is_retryable_and_returns_retry_after(tmp_path):
 
 
 def test_delete_object_requires_login(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     client.cookies.clear()
     response = client.delete('/objects/sample.txt')
     assert response.status_code == 401
@@ -808,7 +1208,7 @@ def test_delete_object_requires_login(tmp_path):
 
 
 def test_delete_object_success(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     response = client.delete('/objects/folder%2Fsample.txt')
     assert response.status_code == 200
     payload = response.json()
@@ -820,7 +1220,7 @@ def test_delete_object_success(tmp_path):
 
 
 def test_delete_object_failure_is_reported(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
 
     def boom(object_name):
         raise RuntimeError('missing object')
@@ -832,14 +1232,14 @@ def test_delete_object_failure_is_reported(tmp_path):
 
 
 def test_batch_delete_objects_requires_at_least_one_name(tmp_path):
-    client, _ = make_client(tmp_path)
+    client, _, _ = make_client(tmp_path)
     response = client.post('/objects/batch-delete', json={'object_names': []})
     assert response.status_code == 400
     assert response.json()['detail'] == '至少要选择一个对象'
 
 
 def test_batch_delete_objects_success(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     response = client.post(
         '/objects/batch-delete',
         json={'object_names': ['alpha.txt', 'folder/beta.txt', 'alpha.txt']},
@@ -855,7 +1255,7 @@ def test_batch_delete_objects_success(tmp_path):
 
 
 def test_batch_delete_objects_trims_empty_names_and_preserves_first_seen_order(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
     response = client.post(
         '/objects/batch-delete',
         json={'object_names': ['  ', 'gamma.txt', ' alpha.txt ', 'gamma.txt', '', 'alpha.txt']},
@@ -869,7 +1269,7 @@ def test_batch_delete_objects_trims_empty_names_and_preserves_first_seen_order(t
 
 
 def test_batch_delete_objects_partial_failure(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
 
     def selective_delete(object_name):
         if object_name == 'folder/beta.txt':
@@ -895,7 +1295,7 @@ def test_batch_delete_objects_partial_failure(tmp_path):
 
 
 def test_batch_delete_objects_failure_when_all_fail(tmp_path):
-    client, fake_storage = make_client(tmp_path)
+    client, fake_storage, _ = make_client(tmp_path)
 
     def always_fail(object_name):
         raise RuntimeError(f'boom-{object_name}')
