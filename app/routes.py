@@ -948,15 +948,29 @@ async def commit_server_upload(request: Request, payload: ServerProxyCommitReque
     conflict = _ensure_no_upload_conflict(storage, object_name=session.object_name, overwrite=payload.overwrite)
     if conflict is not None:
         return conflict
+    try:
+        temp_store.update(
+            temp_upload_id,
+            lambda current: (
+                (_ for _ in ()).throw(HTTPException(status_code=409, detail="临时上传已提交，请勿重复创建后台任务"))
+                if current.committed
+                else setattr(current, "committed", True)
+            ),
+        )
+    except HTTPException:
+        raise
     manager = get_upload_task_manager()
-    task = await run_in_threadpool(
-        manager.create_task_from_staged_file,
-        filename=payload.filename,
-        content_type=payload.content_type or session.content_type,
-        staged_path=str(staged_path),
-        total_size=payload.file_size,
-    )
-    temp_store.update(temp_upload_id, lambda s: setattr(s, "committed", True))
+    try:
+        task = await run_in_threadpool(
+            manager.create_task_from_staged_file,
+            filename=payload.filename,
+            content_type=payload.content_type or session.content_type,
+            staged_path=str(staged_path),
+            total_size=payload.file_size,
+        )
+    except Exception:
+        temp_store.update(temp_upload_id, lambda current: setattr(current, "committed", False))
+        raise
     return {
         "ok": True,
         "task_id": task.task_id,

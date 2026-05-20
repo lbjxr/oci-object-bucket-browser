@@ -21,6 +21,10 @@ TERMINAL_STATUSES = {"completed", "failed", "canceled"}
 ACTIVE_STATUSES = {"queued", "running", "finalizing"}
 
 
+class UploadTaskCanceledError(RuntimeError):
+    pass
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -387,7 +391,14 @@ class ServerUploadTaskManager:
             return None
         if task.status in TERMINAL_STATUSES:
             return task
-        return self.task_store.update(task_id, lambda t: setattr(t, "status", "canceled"))
+        return self.task_store.update(
+            task_id,
+            lambda t: (
+                setattr(t, "status", "canceled"),
+                setattr(t, "phase", "canceled"),
+                setattr(t, "error", None),
+            ),
+        )
 
     def recover_incomplete_tasks(self) -> list[str]:
         recovered: list[str] = []
@@ -419,6 +430,18 @@ class ServerUploadTaskManager:
     def _run_task_safe(self, task_id: str) -> None:
         try:
             self._run_task(task_id)
+        except UploadTaskCanceledError:
+            try:
+                self.task_store.update(
+                    task_id,
+                    lambda t: (
+                        setattr(t, "status", "canceled"),
+                        setattr(t, "phase", "canceled"),
+                        setattr(t, "error", None),
+                    ),
+                )
+            except Exception:
+                pass
         except Exception as exc:
             try:
                 self.task_store.update(task_id, lambda t: (setattr(t, "status", "failed"), setattr(t, "phase", "error"), setattr(t, "error", str(exc))))
@@ -433,7 +456,7 @@ class ServerUploadTaskManager:
         if not task:
             raise FileNotFoundError(task_id)
         if task.status == "canceled":
-            raise RuntimeError("上传任务已取消")
+            raise UploadTaskCanceledError("上传任务已取消")
         return task
 
     def _run_task(self, task_id: str) -> None:

@@ -381,6 +381,47 @@ def test_single_put_task_retries_retryable_error_and_then_succeeds(monkeypatch, 
     wait_for_task_absence(manager, task.task_id)
 
 
+def test_cancel_during_retry_wait_keeps_canceled_status(monkeypatch, tmp_path):
+    backend = FakeStorageBackend()
+    backend.fail_single_put_remaining = 99
+    FakeOCIStorageService.backend = backend
+    monkeypatch.setattr('app.upload_tasks.OCIStorageService', FakeOCIStorageService)
+
+    settings = build_settings(tmp_path)
+    manager = ServerUploadTaskManager(settings=settings, auto_recover=False)
+    manager._base_retry_delay_seconds = 0.2
+    manager._max_retry_delay_seconds = 0.2
+    manager._completed_task_grace_period_seconds = 0.3
+
+    staged_path = tmp_path / 'upload-staging' / 'cancel-retry.txt'
+    staged_path.parent.mkdir(parents=True, exist_ok=True)
+    staged_path.write_bytes(b'cancel retry')
+
+    task = manager.create_task_from_staged_file(
+        filename='cancel-retry.txt',
+        content_type='text/plain',
+        staged_path=str(staged_path),
+        total_size=len(b'cancel retry'),
+    )
+
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        current = manager.task_store.get(task.task_id)
+        if current and current.phase.startswith('retrying_single_put:'):
+            break
+        time.sleep(0.02)
+    else:
+        raise AssertionError('task did not enter retrying state in time')
+
+    canceled = manager.cancel(task.task_id)
+    assert canceled is not None
+
+    finished = wait_for_task_completion(manager, task.task_id)
+    assert finished.status == 'canceled'
+    assert finished.phase == 'canceled'
+    assert finished.error is None
+
+
 
 def test_completed_task_visible_window_uses_settings_value(monkeypatch, tmp_path):
     backend = FakeStorageBackend()

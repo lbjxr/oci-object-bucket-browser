@@ -173,7 +173,7 @@ def test_server_proxy_upload_init_rejects_existing_object_without_overwrite(tmp_
 
 
 
-def test_server_proxy_upload_commit_allows_overwrite_after_confirmation(tmp_path):
+def test_server_proxy_upload_commit_rejects_duplicate_submit_after_background_task_created(tmp_path):
     from tests.test_upload_routes import make_client
 
     client, fake_storage, manager = make_client(tmp_path)
@@ -206,12 +206,14 @@ def test_server_proxy_upload_commit_allows_overwrite_after_confirmation(tmp_path
         json={'filename': 'movie-new.mkv', 'file_size': 10 * 1024 * 1024, 'content_type': 'video/x-matroska'},
     )
     assert conflict_commit.status_code == 200
+    assert len(manager.created) == 1
     overwrite_commit = client.post(
         f'/api/server-uploads/commit?temp_upload_id={temp_upload_id}',
         json={'filename': 'movie-new.mkv', 'file_size': 10 * 1024 * 1024, 'content_type': 'video/x-matroska', 'overwrite': True},
     )
-    assert overwrite_commit.status_code == 200
-    assert overwrite_commit.json()['task_id'] == 'task-1'
+    assert overwrite_commit.status_code == 409
+    assert overwrite_commit.json()['detail'] == '临时上传已提交，请勿重复创建后台任务'
+    assert len(manager.created) == 1
 
 
 
@@ -263,3 +265,50 @@ def test_server_proxy_task_cancel_endpoint(tmp_path):
     assert payload['ok'] is True
     assert payload['status'] == 'canceled'
     assert manager.task.status == 'canceled'
+
+
+def test_server_proxy_commit_rejects_duplicate_commit_for_same_temp_upload(tmp_path):
+    from tests.test_upload_routes import make_client
+
+    client, _fake_storage, manager = make_client(tmp_path)
+
+    init = client.post(
+        '/api/server-uploads/init',
+        json={
+            'filename': 'tiny.txt',
+            'file_size': 3,
+            'content_type': 'text/plain',
+            'file_fingerprint': 'tiny.txt::3::text/plain::dup-commit',
+        },
+    )
+    temp_upload_id = init.json()['temp_upload_id']
+
+    stage = client.put(
+        f'/api/server-uploads/staging/{temp_upload_id}?chunk_index=0&chunk_sha256=ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
+        content=b'abc',
+        headers={'Content-Type': 'application/octet-stream'},
+    )
+    assert stage.status_code == 200
+
+    first_commit = client.post(
+        f'/api/server-uploads/commit?temp_upload_id={temp_upload_id}',
+        json={
+            'filename': 'tiny.txt',
+            'file_size': 3,
+            'content_type': 'text/plain',
+        },
+    )
+    assert first_commit.status_code == 200
+    assert len(manager.created) == 1
+
+    second_commit = client.post(
+        f'/api/server-uploads/commit?temp_upload_id={temp_upload_id}',
+        json={
+            'filename': 'tiny.txt',
+            'file_size': 3,
+            'content_type': 'text/plain',
+        },
+    )
+    assert second_commit.status_code == 409
+    assert second_commit.json()['detail'] == '临时上传已提交，请勿重复创建后台任务'
+    assert len(manager.created) == 1

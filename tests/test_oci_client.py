@@ -1,6 +1,7 @@
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from app.oci_client import OCIStorageService
+from app.oci_client import OCIStorageService, _coerce_retry_after_seconds
 
 
 class _Part:
@@ -39,3 +40,12 @@ def test_list_multipart_uploaded_parts_accepts_list_payload_with_part_number(mon
     assert service.client.calls == [
         ('ns', 'bucket', 'big.bin', 'mp-1', 1000, None)
     ]
+
+
+def test_coerce_retry_after_seconds_accepts_http_date():
+    future = datetime.now(timezone.utc) + timedelta(seconds=30)
+
+    seconds = _coerce_retry_after_seconds(future.strftime('%a, %d %b %Y %H:%M:%S GMT'))
+
+    assert seconds is not None
+    assert 1 <= seconds <= 30
