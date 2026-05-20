@@ -25,3 +25,4 @@ venv/
 # Local runtime files
 *.log
 tmp/
+.learnings/
