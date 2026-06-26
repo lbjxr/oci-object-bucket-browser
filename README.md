@@ -240,12 +240,38 @@ APP_UPLOAD_CLEANUP_STALE_STAGING_RETENTION_HOURS=24
 - `APP_UPLOAD_CLEANUP_FAILED_RETENTION_HOURS`：失败或取消任务保留多久后再清理任务元数据和残留 staging 文件，默认 72 小时
 - `APP_UPLOAD_CLEANUP_STALE_STAGING_RETENTION_HOURS`：未提交、长期无更新的 staging 会话保留多久后清理，默认 24 小时
 
-## 本地运行
+## 部署与启动
+
+### 方式一：systemd 服务（推荐）
+
+本项目已配置 systemd 服务文件，可直接安装并启动：
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
+# 1. 安装依赖
+cd /root/.openclaw/workspace/tmp/projects/oci-object-bucket-browser
+source .venv/bin/activate
 pip install -r requirements.txt
+
+# 2. 配置环境变量
+# 编辑 .env，填入正确的 OCI 配置（参考 .env.example）
+
+# 3. 安装 systemd 服务
+sudo cp deploy/systemd/oci-object-bucket-browser.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable oci-object-bucket-browser.service
+sudo systemctl start oci-object-bucket-browser.service
+
+# 4. 检查状态
+sudo systemctl status oci-object-bucket-browser.service
+```
+
+服务默认监听 `0.0.0.0:25103`。
+
+### 方式二：手动启动
+
+```bash
+cd /root/.openclaw/workspace/tmp/projects/oci-object-bucket-browser
+source .venv/bin/activate
 export $(grep -v '^#' .env | xargs)
 uvicorn app.main:app --host 0.0.0.0 --port 25103
 ```
