@@ -1,6 +1,13 @@
 {% extends "base.html" %}
 
 {% block title %}对象列表 · {{ app_title }}{% endblock %}
+{% block page_title %}文件管理{% endblock %}
+{% block page_description %}浏览、筛选并管理当前 Bucket 中的对象与目录。{% endblock %}
+{% block page_actions %}
+<button id="upload-panel-toggle" class="button" type="button" aria-controls="upload-workbench" aria-expanded="false">上传文件</button>
+<button id="top-create-folder-button" class="button button-secondary" type="button">新建文件夹</button>
+<button id="top-refresh-file-panel" class="icon-button icon-button-bordered" type="button" title="刷新列表" aria-label="刷新列表">&#x21bb;</button>
+{% endblock %}
 
 {% block content %}
 {% if error %}
@@ -10,6 +17,7 @@
 <div id="upload-success" class="alert alert-success hidden" aria-live="polite"></div>
 <div id="conflict-feedback" class="alert alert-error hidden" aria-live="polite"></div>
 
+<div id="upload-workbench" class="upload-workbench hidden">
 <div class="grid two-columns form-grid">
   <section class="card panel compact-panel form-panel">
     <div class="panel-header">
@@ -70,13 +78,18 @@
       <h2>上传任务</h2>
       <p>这里显示最近的服务端上传任务与进度。</p>
     </div>
-    <button id="refresh-upload-tasks" class="button button-secondary" type="button">刷新任务</button>
+    <div class="button-row">
+      <a class="button button-secondary button-inline" href="/uploads">查看全部</a>
+      <button id="refresh-upload-tasks" class="button button-secondary" type="button">刷新任务</button>
+    </div>
   </div>
   <div id="upload-task-list" class="object-list single-list">
     <div class="empty-state">还没有上传任务。</div>
   </div>
 </section>
+</div>
 
+<div class="file-workspace">
 <section class="card panel compact-panel form-panel">
   <div class="panel-header panel-header-inline panel-header-list-actions">
     <div class="file-manager-header-main">
@@ -105,7 +118,7 @@
       {% endif %}
       <button id="create-folder-button" class="button button-secondary button-inline" type="button">新建文件夹</button>
       <button id="refresh-file-panel" class="button button-secondary button-inline" type="button">刷新列表</button>
-      <span id="file-manager-count" class="pill">共 {{ folders|length + objects|length }} 项</span>
+      <span id="file-manager-count" class="pill">共 {{ file_page.total_items }} 项</span>
     </div>
   </div>
 
@@ -114,9 +127,49 @@
     <button id="create-folder-submit" class="button button-inline" type="button">创建</button>
   </div>
 
+  <form class="file-filter-bar" action="/" method="get">
+    <input type="hidden" name="prefix" value="{{ current_prefix }}">
+    <label class="filter-search" for="file-query">
+      <span class="visually-hidden">搜索当前目录</span>
+      <input id="file-query" class="input-text" type="search" name="query" value="{{ filters.query }}" placeholder="搜索当前目录">
+    </label>
+    <label>
+      <span class="visually-hidden">文件类型</span>
+      <select class="input-select" name="file_type">
+        <option value="all"{% if filters.normalized_file_type == 'all' %} selected{% endif %}>全部类型</option>
+        <option value="folder"{% if filters.normalized_file_type == 'folder' %} selected{% endif %}>文件夹</option>
+        <option value="image"{% if filters.normalized_file_type == 'image' %} selected{% endif %}>图片</option>
+        <option value="pdf"{% if filters.normalized_file_type == 'pdf' %} selected{% endif %}>PDF</option>
+        <option value="text"{% if filters.normalized_file_type == 'text' %} selected{% endif %}>文本</option>
+        <option value="archive"{% if filters.normalized_file_type == 'archive' %} selected{% endif %}>压缩包</option>
+        <option value="other"{% if filters.normalized_file_type == 'other' %} selected{% endif %}>其他文件</option>
+      </select>
+    </label>
+    <label class="size-filter">
+      <span class="visually-hidden">最小大小 MB</span>
+      <input class="input-text" type="number" min="0" step="0.1" name="size_min" value="{{ filters.size_min_mb if filters.size_min_mb is not none else '' }}" placeholder="最小 MB">
+    </label>
+    <label class="size-filter">
+      <span class="visually-hidden">最大大小 MB</span>
+      <input class="input-text" type="number" min="0" step="0.1" name="size_max" value="{{ filters.size_max_mb if filters.size_max_mb is not none else '' }}" placeholder="最大 MB">
+    </label>
+    <input type="hidden" name="page_size" value="{{ file_page.page_size }}">
+    <button class="button button-secondary button-inline" type="submit">筛选</button>
+    {% if filters.normalized_query or filters.normalized_file_type != 'all' or filters.size_min_mb is not none or filters.size_max_mb is not none %}
+    <a class="toolbar-link" href="/?prefix={{ current_prefix }}">清除筛选</a>
+    {% endif %}
+  </form>
+
+  <div class="file-table-header" aria-hidden="true">
+    <span>名称</span>
+    <span>大小</span>
+    <span>修改时间</span>
+    <span>操作</span>
+  </div>
+
   <div id="object-list" class="object-list single-list" data-current-prefix="{{ current_prefix }}">
     {% for folder in folders %}
-    <article class="object-card object-card-unified object-row-card" data-object-row data-object-name="{{ folder.full_prefix }}" data-object-kind="folder">
+    <article class="object-card object-card-unified object-row-card" data-object-row data-object-name="{{ folder.full_prefix }}" data-object-kind="folder" data-detail-name="{{ folder.name }}/" data-detail-type="文件夹" data-detail-size="-" data-detail-path="{{ folder.full_prefix }}" data-detail-time="-">
       <div class="object-row-shell folder-row-shell">
         <div class="object-row-main">
           <div class="object-main">
@@ -145,7 +198,7 @@
     {% endfor %}
 
     {% for obj in objects %}
-    <article class="object-card object-card-unified object-row-card" data-object-row data-object-name="{{ obj.name }}" data-object-kind="file">
+    <article class="object-card object-card-unified object-row-card" data-object-row data-object-name="{{ obj.name }}" data-object-kind="file" data-detail-name="{{ obj.name.split('/')[-1] }}" data-detail-type="{{ obj.file_type_label }}" data-detail-size="{{ obj.size_exact }}" data-detail-path="{{ obj.name }}" data-detail-time="{{ obj.time_display or '-' }}">
       <div class="object-row-shell object-row-shell-selectable">
         <label class="object-select-control" aria-label="选择 {{ obj.name }}">
           <input class="object-select-checkbox js-object-select" type="checkbox" value="{{ obj.name }}" data-object-name="{{ obj.name }}">
@@ -202,7 +255,51 @@
       <button id="batch-delete-button" class="toolbar-link toolbar-link-danger" type="button" disabled>批量删除</button>
     </div>
   </div>
+
+  <div class="file-pagination" aria-label="文件分页">
+    <span>显示 {{ file_page.start_item }}-{{ file_page.end_item }} 项，共 {{ file_page.total_items }} 项</span>
+    <form action="/" method="get" class="pagination-actions">
+      <input type="hidden" name="prefix" value="{{ current_prefix }}">
+      <input type="hidden" name="query" value="{{ filters.query }}">
+      <input type="hidden" name="file_type" value="{{ filters.normalized_file_type }}">
+      {% if filters.size_min_mb is not none %}<input type="hidden" name="size_min" value="{{ filters.size_min_mb }}">{% endif %}
+      {% if filters.size_max_mb is not none %}<input type="hidden" name="size_max" value="{{ filters.size_max_mb }}">{% endif %}
+      <label class="page-size-label">每页
+        <select class="input-select input-select-compact" name="page_size" onchange="this.form.submit()">
+          {% for option in [10, 25, 50, 100] %}
+          <option value="{{ option }}"{% if file_page.page_size == option %} selected{% endif %}>{{ option }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <button class="icon-button icon-button-bordered" type="submit" name="page" value="{{ file_page.page - 1 }}" aria-label="上一页" title="上一页"{% if not file_page.has_previous %} disabled{% endif %}>&#x2190;</button>
+      <span class="page-indicator">{{ file_page.page }} / {{ file_page.total_pages }}</span>
+      <button class="icon-button icon-button-bordered" type="submit" name="page" value="{{ file_page.page + 1 }}" aria-label="下一页" title="下一页"{% if not file_page.has_next %} disabled{% endif %}>&#x2192;</button>
+    </form>
+  </div>
 </section>
+
+<aside id="file-detail-panel" class="file-detail-panel" aria-label="文件详情">
+  <div class="detail-empty" id="file-detail-empty">
+    <span class="detail-empty-icon" aria-hidden="true">i</span>
+    <h2>文件详情</h2>
+    <p>选择一个文件或文件夹查看路径、类型和状态。</p>
+  </div>
+  <div class="detail-content hidden" id="file-detail-content">
+    <div class="detail-heading">
+      <span class="detail-type" id="detail-type">文件</span>
+      <h2 id="detail-name"></h2>
+    </div>
+    <dl class="detail-list">
+      <div><dt>大小</dt><dd id="detail-size"></dd></div>
+      <div><dt>路径</dt><dd><code id="detail-path"></code></dd></div>
+      <div><dt>修改时间</dt><dd id="detail-time"></dd></div>
+      <div><dt>权限</dt><dd>由 Bucket 与 IAM 策略管理</dd></div>
+      <div><dt>上传状态</dt><dd>已入桶</dd></div>
+      <div><dt>最近操作</dt><dd>当前会话暂无记录</dd></div>
+    </dl>
+  </div>
+</aside>
+</div>
 
 <div id="object-delete-feedback" class="alert hidden" aria-live="polite"></div>
 <form id="batch-download-form" action="/objects/batch-download" method="post" target="batch-download-frame" class="hidden" aria-hidden="true">
@@ -228,6 +325,8 @@
 
 <script>
 (() => {
+  const trashEnabled = {{ trash_enabled|tojson }};
+  const batchDeleteConfirmationRequired = {{ batch_delete_confirmation_required|tojson }};
   const deleteButtons = Array.from(document.querySelectorAll('.js-delete-object'));
   const renameButtons = Array.from(document.querySelectorAll('.js-rename-path'));
   const deletePathButtons = Array.from(document.querySelectorAll('.js-delete-path'));
@@ -249,6 +348,17 @@
   const createFolderButton = document.getElementById('create-folder-button');
   const createFolderSubmit = document.getElementById('create-folder-submit');
   const newFolderInput = document.getElementById('new-folder-name');
+  const uploadPanelToggle = document.getElementById('upload-panel-toggle');
+  const uploadWorkbench = document.getElementById('upload-workbench');
+  const topCreateFolderButton = document.getElementById('top-create-folder-button');
+  const topRefreshFilePanel = document.getElementById('top-refresh-file-panel');
+  const fileDetailEmpty = document.getElementById('file-detail-empty');
+  const fileDetailContent = document.getElementById('file-detail-content');
+  const detailName = document.getElementById('detail-name');
+  const detailType = document.getElementById('detail-type');
+  const detailSize = document.getElementById('detail-size');
+  const detailPath = document.getElementById('detail-path');
+  const detailTime = document.getElementById('detail-time');
   const breadcrumbBox = document.getElementById('file-manager-breadcrumbs');
   const currentDirectoryLabel = document.getElementById('current-directory-label');
   const form = document.getElementById('upload-form');
@@ -277,6 +387,11 @@
   const TASK_REFRESH_INTERVAL_MS = 5000;
 
   const currentPrefix = () => objectList?.dataset.currentPrefix || '';
+  const currentFilterParams = () => {
+    const params = new URLSearchParams(window.location.search);
+    params.set('prefix', currentPrefix());
+    return params;
+  };
   const fileFingerprint = (file) => [file.name, file.size, file.type || '', file.lastModified || 0].join('::');
   const saveResumeState = (payload) => { try { localStorage.setItem(RESUME_STORAGE_KEY, JSON.stringify(payload)); } catch (_) {} };
   const loadResumeState = () => { try { const raw = localStorage.getItem(RESUME_STORAGE_KEY); return raw ? JSON.parse(raw) : null; } catch (_) { return null; } };
@@ -447,6 +562,11 @@
     article.dataset.objectRow = '';
     article.dataset.objectName = folder.full_prefix;
     article.dataset.objectKind = 'folder';
+    article.dataset.detailName = `${folder.name}/`;
+    article.dataset.detailType = '文件夹';
+    article.dataset.detailSize = '-';
+    article.dataset.detailPath = folder.full_prefix;
+    article.dataset.detailTime = '-';
     article.innerHTML = `
       <div class="object-row-shell folder-row-shell">
         <div class="object-row-main">
@@ -477,6 +597,11 @@
     article.dataset.objectName = file.name;
     article.dataset.objectKind = 'file';
     const basename = String(file.name || '').split('/').pop() || file.name || '';
+    article.dataset.detailName = basename;
+    article.dataset.detailType = file.file_type_label || '文件';
+    article.dataset.detailSize = file.size_display || '-';
+    article.dataset.detailPath = file.name;
+    article.dataset.detailTime = file.time_display || '-';
     article.innerHTML = `
       <div class="object-row-shell object-row-shell-selectable">
         <label class="object-select-control" aria-label="选择 ${escapeHtml(file.name)}">
@@ -551,8 +676,8 @@
         const path = button.dataset.path || button.dataset.objectName || '';
         const kind = button.dataset.kind || 'file';
         const message = kind === 'folder'
-          ? `确认删除目录「${path}」吗？会删除该目录下全部对象，且不可恢复。`
-          : `确认删除对象「${path}」吗？删除后不可恢复。`;
+          ? `确认删除目录「${path}」吗？会处理该目录下全部对象。${trashEnabled ? '对象会先移入回收站。' : '删除后不可恢复。'}`
+          : `确认删除对象「${path}」吗？${trashEnabled ? '对象会先移入回收站。' : '删除后不可恢复。'}`;
         if (!window.confirm(message)) return;
         try {
           if (kind === 'file' && button.classList.contains('js-delete-object')) {
@@ -681,7 +806,7 @@
   const refreshFilePanel = async () => {
     if (!objectList) return;
     try {
-      const result = await jsonFetch(`/api/files?prefix=${encodeURIComponent(currentPrefix())}`);
+      const result = await jsonFetch(`/api/files?${currentFilterParams().toString()}`);
       const rows = [];
       (result.folders || []).forEach((folder) => rows.push(buildFolderRow(folder).outerHTML));
       (result.files || []).forEach((file) => rows.push(buildFileRow(file).outerHTML));
@@ -806,9 +931,20 @@
   const handleBatchDelete = async () => {
     const selected = getSelectedObjectNames();
     if (selected.length === 0) return;
-    if (!window.confirm(`确认批量删除已选中的 ${selected.length} 个对象吗？删除后不可恢复。`)) return;
+    let confirmationCount = null;
+    if (batchDeleteConfirmationRequired) {
+      const entered = window.prompt(`将批量处理 ${selected.length} 个对象。请输入 ${selected.length} 以确认。`);
+      if (entered === null) return;
+      if (entered.trim() !== String(selected.length)) {
+        showDeleteFeedback(`确认数量不匹配，未执行删除。请输入 ${selected.length}。`, 'error');
+        return;
+      }
+      confirmationCount = selected.length;
+    } else if (!window.confirm(`确认批量删除已选中的 ${selected.length} 个对象吗？${trashEnabled ? '对象会先移入回收站。' : '删除后不可恢复。'}`)) {
+      return;
+    }
     try {
-      const result = await jsonFetch('/objects/batch-delete', { method: 'POST', body: JSON.stringify({object_names: selected}) });
+      const result = await jsonFetch('/objects/batch-delete', { method: 'POST', body: JSON.stringify({object_names: selected, confirmation_count: confirmationCount}) });
       removeObjectRows(Array.isArray(result.deleted) ? result.deleted : []);
       showDeleteFeedback(`✅ ${result.message || '批量删除成功'}`, 'success');
     } catch (error) {
@@ -948,6 +1084,34 @@
   });
 
   if (refreshTaskBtn) refreshTaskBtn.addEventListener('click', refreshTasks);
+  if (uploadPanelToggle && uploadWorkbench) uploadPanelToggle.addEventListener('click', () => {
+    const willOpen = uploadWorkbench.classList.contains('hidden');
+    uploadWorkbench.classList.toggle('hidden', !willOpen);
+    uploadPanelToggle.setAttribute('aria-expanded', String(willOpen));
+    if (willOpen) fileInput?.focus();
+  });
+  if (new URLSearchParams(window.location.search).get('upload') === '1' && uploadPanelToggle && uploadWorkbench?.classList.contains('hidden')) {
+    uploadPanelToggle.click();
+  }
+  if (topCreateFolderButton) topCreateFolderButton.addEventListener('click', () => {
+    newFolderInput?.focus();
+    newFolderInput?.scrollIntoView({block: 'center', behavior: 'smooth'});
+  });
+  if (topRefreshFilePanel) topRefreshFilePanel.addEventListener('click', refreshFilePanel);
+  if (objectList) objectList.addEventListener('click', (event) => {
+    if (event.target.closest('a, button, input, label')) return;
+    const row = event.target.closest('[data-object-row]');
+    if (!row || !fileDetailContent || !fileDetailEmpty) return;
+    objectList.querySelectorAll('[data-object-row].is-selected').forEach((item) => item.classList.remove('is-selected'));
+    row.classList.add('is-selected');
+    detailName.textContent = row.dataset.detailName || row.dataset.objectName || '';
+    detailType.textContent = row.dataset.detailType || (row.dataset.objectKind === 'folder' ? '文件夹' : '文件');
+    detailSize.textContent = row.dataset.detailSize || '-';
+    detailPath.textContent = row.dataset.detailPath || row.dataset.objectName || '-';
+    detailTime.textContent = row.dataset.detailTime || '-';
+    fileDetailEmpty.classList.add('hidden');
+    fileDetailContent.classList.remove('hidden');
+  });
   bindRowActions(document);
   syncBatchDeleteToolbar();
   updateObjectCount();

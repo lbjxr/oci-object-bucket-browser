@@ -400,6 +400,38 @@ class ServerUploadTaskManager:
             ),
         )
 
+    def retry(self, task_id: str) -> ServerUploadTask | None:
+        task = self.task_store.get(task_id)
+        if not task:
+            return None
+        if task.status != "failed":
+            raise ValueError("只有失败任务可以手动重试")
+        if not Path(task.temp_path).exists():
+            raise FileNotFoundError("任务暂存文件不存在，无法重试")
+        with self._threads_lock:
+            existing = self._threads.get(task_id)
+            if existing and existing.is_alive():
+                raise RuntimeError("任务线程仍在收尾，请稍后重试")
+        task = self.task_store.update(
+            task_id,
+            lambda current: (
+                setattr(current, "status", "queued"),
+                setattr(current, "phase", "manual_retry_queued"),
+                setattr(current, "error", None),
+            ),
+        )
+        self.start(task_id)
+        return task
+
+    def clear_completed(self) -> int:
+        deleted_count = 0
+        for task in self.task_store.list_all():
+            if task.status != "completed":
+                continue
+            if self.task_store.delete(task.task_id):
+                deleted_count += 1
+        return deleted_count
+
     def recover_incomplete_tasks(self) -> list[str]:
         recovered: list[str] = []
         for task in self.task_store.list_all():
@@ -754,7 +786,9 @@ def get_upload_task_manager() -> ServerUploadTaskManager:
         return _manager
     with _manager_lock:
         if _manager is None:
-            _manager = ServerUploadTaskManager()
+            from app.settings_store import get_app_settings_store
+
+            _manager = ServerUploadTaskManager(settings=get_app_settings_store().effective_settings())
     return _manager
 
 

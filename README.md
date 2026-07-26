@@ -40,6 +40,15 @@
 - 上传进度、速度、ETA
 - 上传会话恢复
 - 远端 multipart 对账恢复
+- 分享链接管理（过期、撤销、密码与下载次数限制）
+- 存储统计（容量、数量、近 7 日上传量与类型占比）
+- WebDAV Basic Auth（OPTIONS / PROPFIND / GET / PUT / DELETE / MKCOL / MOVE）
+- 设置页、只读模式与回收站删除策略
+
+高保真实现与验收基线：
+
+- [功能清单](docs/HIFI_FEATURE_LIST.md)
+- [开发与回归计划](docs/HIFI_DEVELOPMENT_PLAN.md)
 
 ## 技术栈
 
@@ -193,6 +202,8 @@ OCI_PROFILE=DEFAULT
 OCI_NAMESPACE=your_namespace
 OCI_BUCKET_NAME=your_bucket_name
 OCI_COMPARTMENT_ID=
+OCI_REGION=
+OCI_PREFIX_ROOT=
 OCI_PREVIEW_TEXT_LIMIT=20000
 OCI_MAX_LIST_LIMIT=200
 
@@ -200,6 +211,9 @@ APP_AUTH_USERNAME=your_admin_username
 APP_AUTH_PASSWORD=your_admin_password_here
 APP_SESSION_SECRET=replace_with_a_random_long_session_secret
 APP_SESSION_COOKIE_NAME=oci_bucket_browser_session
+APP_SETTINGS_FILE=./tmp/settings.json
+APP_TRASH_RECORD_FILE=./tmp/trash_records.json
+APP_SHARE_FILE=./tmp/shares.json
 APP_UPLOAD_CHUNK_SIZE_MB=16
 APP_UPLOAD_SINGLE_PUT_THRESHOLD_MB=32
 APP_UPLOAD_PARALLELISM=6
@@ -211,7 +225,7 @@ APP_UPLOAD_CLEANUP_ENABLED=true
 APP_UPLOAD_CLEANUP_STARTUP_ENABLED=true
 APP_UPLOAD_CLEANUP_SCHEDULER_ENABLED=true
 APP_UPLOAD_CLEANUP_INTERVAL_SECONDS=3600
-APP_UPLOAD_COMPLETED_TASK_VISIBLE_SECONDS=1.0
+APP_UPLOAD_COMPLETED_TASK_VISIBLE_SECONDS=86400
 APP_UPLOAD_CLEANUP_COMPLETED_RETENTION_HOURS=24
 APP_UPLOAD_CLEANUP_FAILED_RETENTION_HOURS=72
 APP_UPLOAD_CLEANUP_STALE_STAGING_RETENTION_HOURS=24
@@ -224,6 +238,9 @@ APP_UPLOAD_CLEANUP_STALE_STAGING_RETENTION_HOURS=24
 - `APP_AUTH_USERNAME`：固定登录用户名
 - `APP_AUTH_PASSWORD`：固定登录密码
 - `APP_SESSION_SECRET`：session 签名密钥
+- `APP_SETTINGS_FILE`：设置页保存的本地 JSON；同名环境变量配置始终优先
+- `APP_TRASH_RECORD_FILE`：回收站操作记录 JSON；默认位于 `./tmp/trash_records.json`
+- `APP_SHARE_FILE`：分享记录 JSON；默认位于 `./tmp/shares.json`，其中只保存 token hash 与密码 hash
 - `APP_UPLOAD_CHUNK_SIZE_MB`：分片大小，默认 16 MB
 - `APP_UPLOAD_SINGLE_PUT_THRESHOLD_MB`：单请求上传阈值，默认 32 MB
 - `APP_UPLOAD_PARALLELISM`：服务端上传 OCI 的并发分片数，默认 6
@@ -235,10 +252,24 @@ APP_UPLOAD_CLEANUP_STALE_STAGING_RETENTION_HOURS=24
 - `APP_UPLOAD_CLEANUP_STARTUP_ENABLED`：服务启动时是否做一次轻量清理，默认 `true`
 - `APP_UPLOAD_CLEANUP_SCHEDULER_ENABLED`：是否启用进程内定时清理线程，默认 `true`
 - `APP_UPLOAD_CLEANUP_INTERVAL_SECONDS`：后台定时清理间隔，默认 `3600` 秒
-- `APP_UPLOAD_COMPLETED_TASK_VISIBLE_SECONDS`：成功入桶后 completed 任务在任务列表里继续短暂展示多久再自动删除，默认 `1.0` 秒
+- `APP_UPLOAD_COMPLETED_TASK_VISIBLE_SECONDS`：成功入桶后 completed 任务在任务列表里继续展示多久再自动删除，默认 `86400` 秒（24 小时）
 - `APP_UPLOAD_CLEANUP_COMPLETED_RETENTION_HOURS`：已完成任务保留多久后再清理任务元数据 / staging 元数据 / upload session，默认 24 小时
 - `APP_UPLOAD_CLEANUP_FAILED_RETENTION_HOURS`：失败或取消任务保留多久后再清理任务元数据和残留 staging 文件，默认 72 小时
 - `APP_UPLOAD_CLEANUP_STALE_STAGING_RETENTION_HOURS`：未提交、长期无更新的 staging 会话保留多久后清理，默认 24 小时
+
+设置页可持久化只读模式、对象存储展示值、上传默认值、WebDAV 凭据和危险操作策略。WebDAV 密码只保存 PBKDF2 hash，API 不返回 hash 或明文。启用回收站后，单对象、目录和批量删除会先把对象复制到 `.trash/{timestamp}/{original_key}`，写入本地操作记录，再删除原路径；复制或记录失败时不会删除源对象。批量删除二次确认开启时，客户端必须提交与去重后对象数量一致的 `confirmation_count`。
+
+## 分享链接
+
+“分享”页面支持按对象路径创建临时链接，可选设置访问密码和下载次数上限。完整 token 只在创建响应中返回一次；本地 JSON 只保存 token 的 SHA-256 hash 和密码的 PBKDF2 hash。链接过期、撤销或达到下载上限后，公开访问会明确返回不可用状态。公开下载使用服务端对象流，不会把 OCI 凭据暴露给访问者。
+
+## 存储统计
+
+“存储统计”页面同步扫描当前 bucket 或指定 prefix，展示对象总大小、对象数量、当前范围对象数量、近 7 日上传量及图片 / 文档 / 压缩包 / 其他类型占比。OCI 客户端支持分页全量扫描；统计刷新失败时保留页面已有结果并显示具体错误。
+
+## WebDAV
+
+在设置页启用 WebDAV 并配置独立用户名和密码后，客户端连接地址为 `/webdav/`。支持 `OPTIONS`、`PROPFIND`、`GET`、`PUT`、`DELETE`、`MKCOL`、`MOVE`。WebDAV 根路径遵循 `Prefix Root`；Basic Auth 与 Web UI Session 解耦。只读模式会同时阻止 Web UI 和 WebDAV 的所有对象写操作，删除若启用回收站仍沿用同一份 `.trash/` 记录策略。
 
 ## 部署与启动
 
@@ -248,7 +279,7 @@ APP_UPLOAD_CLEANUP_STALE_STAGING_RETENTION_HOURS=24
 
 ```bash
 # 1. 安装依赖
-cd /root/.openclaw/workspace/tmp/projects/oci-object-bucket-browser
+cd /path/to/oci-object-bucket-browser
 source .venv/bin/activate
 pip install -r requirements.txt
 
@@ -270,7 +301,7 @@ sudo systemctl status oci-object-bucket-browser.service
 ### 方式二：手动启动
 
 ```bash
-cd /root/.openclaw/workspace/tmp/projects/oci-object-bucket-browser
+cd /path/to/oci-object-bucket-browser
 source .venv/bin/activate
 export $(grep -v '^#' .env | xargs)
 uvicorn app.main:app --host 0.0.0.0 --port 25103
@@ -378,6 +409,10 @@ OCI Object Storage 本身没有真实目录，这里采用“前缀 + `/`”模�
   - 冲突确认重试时追加：`"overwrite": true`
 - `POST /api/files/delete`
   - 请求体：`{"path":"docs/"}` 或 `{"path":"docs/a.txt"}`
+
+- `POST /objects/batch-delete`
+  - 请求体：`{"object_names":["docs/a.txt","docs/b.txt"],"confirmation_count":2}`
+  - 当设置中的批量删除二次确认开启时，`confirmation_count` 必须等于去重后的对象数量；关闭时可省略该字段
 
 当发生冲突时，上述写接口会返回：
 

@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+
+{% block title %}上传任务 · {{ app_title }}{% endblock %}
+{% block page_title %}上传任务{% endblock %}
+{% block page_description %}跟踪浏览器暂存后的后台入桶进度、重试与最终结果。{% endblock %}
+{% block page_actions %}
+<a class="button" href="/?upload=1">新建上传</a>
+<button id="clear-completed-tasks" class="button button-secondary" type="button">清理完成任务</button>
+<button id="refresh-tasks" class="icon-button icon-button-bordered" type="button" title="刷新任务" aria-label="刷新任务">&#x21bb;</button>
+{% endblock %}
+
+{% block content %}
+<div id="task-feedback" class="alert hidden" aria-live="polite"></div>
+
+<section class="task-summary-band" aria-label="上传任务概览">
+  <div class="task-summary-item">
+    <span>上传中</span>
+    <strong id="summary-active">{{ task_summary.active_count }}</strong>
+    <small>等待、上传与收尾任务</small>
+  </div>
+  <div class="task-summary-item">
+    <span>今日上传量</span>
+    <strong id="summary-today-bytes" data-bytes="{{ task_summary.today_uploaded_bytes }}">{{ task_summary.today_uploaded_bytes }}</strong>
+    <small>按当前任务记录统计</small>
+  </div>
+  <div class="task-summary-item task-summary-item-warning">
+    <span>失败待重试</span>
+    <strong id="summary-failed">{{ task_summary.failed_count }}</strong>
+    <small>保留失败原因与暂存状态</small>
+  </div>
+</section>
+
+<section class="task-panel">
+  <div class="task-panel-toolbar">
+    <div class="segmented-control" role="group" aria-label="筛选上传任务">
+      <button class="segment is-active" type="button" data-task-filter="all" aria-pressed="true">全部</button>
+      <button class="segment" type="button" data-task-filter="active" aria-pressed="false">进行中</button>
+      <button class="segment" type="button" data-task-filter="failed" aria-pressed="false">失败</button>
+      <button class="segment" type="button" data-task-filter="completed" aria-pressed="false">完成</button>
+      <button class="segment" type="button" data-task-filter="canceled" aria-pressed="false">已取消</button>
+    </div>
+    <span id="task-count" class="muted">共 {{ task_summary.total_count }} 个任务</span>
+  </div>
+
+  <div class="task-table-header" aria-hidden="true">
+    <span>对象</span>
+    <span>进度</span>
+    <span>状态</span>
+    <span>策略</span>
+    <span>更新时间</span>
+    <span>操作</span>
+  </div>
+  <div id="tasks-page-list" class="tasks-page-list" aria-live="polite" aria-busy="true">
+    <div class="task-skeleton"><span></span><span></span><span></span></div>
+    <div class="task-skeleton"><span></span><span></span><span></span></div>
+    <div class="task-skeleton"><span></span><span></span><span></span></div>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/uploads.js?v=20260726-hifi-p2" defer></script>
+{% endblock %}

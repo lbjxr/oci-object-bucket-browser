@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+
+{% block title %}存储统计 · {{ app_title }}{% endblock %}
+{% block page_title %}存储统计{% endblock %}
+{% block page_description %}按对象容量、数量、近期上传与文件类型查看当前 bucket。{% endblock %}
+{% block page_actions %}
+<button id="refresh-storage-stats" class="button" type="button">刷新统计</button>
+{% endblock %}
+
+{% block content %}
+<div id="stats-feedback" class="alert{% if not stats_error %} hidden{% else %} alert-error{% endif %}" aria-live="polite">{{ stats_error or '' }}</div>
+
+<section class="stats-scope-band">
+  <label class="settings-field" for="stats-prefix">
+    <span>统计前缀</span>
+    <input id="stats-prefix" class="input-text" type="text" value="{{ storage_summary.prefix }}" placeholder="留空统计整个 bucket">
+  </label>
+  <button id="apply-stats-prefix" class="button button-secondary" type="button">应用前缀</button>
+  <span id="stats-refreshed-at" class="muted">{% if storage_summary.refreshed_at %}刷新于 {{ storage_summary.refreshed_at[:19]|replace('T', ' ') }} UTC{% endif %}</span>
+</section>
+
+<section class="stats-summary-grid" aria-label="存储概览">
+  <div class="stats-summary-item">
+    <span>对象总大小</span>
+    <strong id="stats-total-size" data-bytes="{{ storage_summary.total_bytes }}">{{ storage_summary.total_bytes }}</strong>
+    <small>不含目录占位对象</small>
+  </div>
+  <div class="stats-summary-item">
+    <span>对象数量</span>
+    <strong id="stats-object-count">{{ storage_summary.object_count }}</strong>
+    <small>当前扫描范围</small>
+  </div>
+  <div class="stats-summary-item">
+    <span>当前前缀对象</span>
+    <strong id="stats-prefix-count">{{ storage_summary.object_count }}</strong>
+    <small id="stats-prefix-label">{{ storage_summary.prefix or 'bucket 根目录' }}</small>
+  </div>
+  <div class="stats-summary-item">
+    <span>近 7 日上传量</span>
+    <strong id="stats-recent-size" data-bytes="{{ storage_summary.recent_7d_bytes }}">{{ storage_summary.recent_7d_bytes }}</strong>
+    <small id="stats-recent-count">{{ storage_summary.recent_7d_object_count }} 个对象</small>
+  </div>
+</section>
+
+<section class="stats-type-panel">
+  <div class="stats-type-heading">
+    <div><h2>类型占比</h2><p>按对象容量计算，数量作为辅助信息。</p></div>
+    <span class="muted">同步扫描结果</span>
+  </div>
+  <div id="stats-type-list" class="stats-type-list" aria-live="polite"></div>
+</section>
+
+<script id="initial-storage-summary" type="application/json">{{ storage_summary|tojson }}</script>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/stats.js?v=20260726-hifi-p5" defer></script>
+{% endblock %}

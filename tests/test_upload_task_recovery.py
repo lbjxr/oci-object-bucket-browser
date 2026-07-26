@@ -108,6 +108,54 @@ def wait_for_task_absence(manager: ServerUploadTaskManager, task_id: str, *, tim
     raise AssertionError(f'task {task_id} still exists after waiting')
 
 
+def test_failed_task_can_be_requeued_and_completed_tasks_can_be_cleared(monkeypatch, tmp_path):
+    settings = build_settings(tmp_path)
+    staged_path = tmp_path / 'upload-staging' / 'retry.bin'
+    staged_path.parent.mkdir(parents=True, exist_ok=True)
+    staged_path.write_bytes(b'retry')
+    task_store = ServerUploadTaskStore(settings.upload_task_dir)
+    failed = task_store.create(
+        object_name='retry.bin',
+        filename='retry.bin',
+        content_type='application/octet-stream',
+        total_size=5,
+        strategy='single-put-server-proxy',
+        temp_path=str(staged_path),
+        parallelism=1,
+        total_parts=None,
+        upload_session_id=None,
+        multipart_upload_id=None,
+    )
+    task_store.update(failed.task_id, lambda task: (setattr(task, 'status', 'failed'), setattr(task, 'phase', 'error'), setattr(task, 'error', 'timeout')))
+    completed = task_store.create(
+        object_name='done.bin',
+        filename='done.bin',
+        content_type='application/octet-stream',
+        total_size=5,
+        strategy='single-put-server-proxy',
+        temp_path=str(staged_path),
+        parallelism=1,
+        total_parts=None,
+        upload_session_id=None,
+        multipart_upload_id=None,
+    )
+    task_store.update(completed.task_id, lambda task: setattr(task, 'status', 'completed'))
+
+    manager = ServerUploadTaskManager(settings=settings, auto_recover=False)
+    started = []
+    monkeypatch.setattr(manager, 'start', lambda task_id: started.append(task_id) or True)
+
+    retried = manager.retry(failed.task_id)
+
+    assert retried is not None
+    assert retried.status == 'queued'
+    assert retried.phase == 'manual_retry_queued'
+    assert retried.error is None
+    assert started == [failed.task_id]
+    assert manager.clear_completed() == 1
+    assert manager.task_store.get(completed.task_id) is None
+
+
 def test_recover_running_multipart_task_completes(monkeypatch, tmp_path):
     backend = FakeStorageBackend()
     FakeOCIStorageService.backend = backend

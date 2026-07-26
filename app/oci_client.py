@@ -158,6 +158,36 @@ class OCIStorageService:
             )
         return entries
 
+    def list_objects_all(self, prefix: str = "") -> list[ObjectEntry]:
+        page = None
+        entries: list[ObjectEntry] = []
+        try:
+            while True:
+                response = self.client.list_objects(
+                    self.namespace,
+                    self.bucket_name,
+                    prefix=prefix or None,
+                    fields="name,size,etag,timeCreated,md5",
+                    limit=1000,
+                    page=page,
+                )
+                for item in response.data.objects:
+                    entries.append(
+                        ObjectEntry(
+                            name=item.name,
+                            size=item.size,
+                            etag=item.etag,
+                            time_created=item.time_created.isoformat() if item.time_created else None,
+                            content_type=guess_content_type(item.name),
+                        )
+                    )
+                page = response.headers.get("opc-next-page")
+                if not page:
+                    break
+        except ServiceError as exc:
+            raise OCIStorageError(f"列出全部对象失败: {exc.message}") from exc
+        return entries
+
     def upload_file(self, object_name: str, fileobj: BinaryIO, content_type: str | None = None) -> None:
         content_type = guess_content_type(object_name, content_type)
         try:

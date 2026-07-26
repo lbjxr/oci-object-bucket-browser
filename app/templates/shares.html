@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+
+{% block title %}分享 · {{ app_title }}{% endblock %}
+{% block page_title %}分享{% endblock %}
+{% block page_description %}创建有时效、可撤销、可限制下载次数的对象访问链接。{% endblock %}
+{% block page_actions %}
+<button id="open-share-form" class="button" type="button">创建分享</button>
+<a class="button button-secondary" href="/api/shares-export">导出列表</a>
+<button id="refresh-shares" class="icon-button icon-button-bordered" type="button" title="刷新分享" aria-label="刷新分享">&#x21bb;</button>
+{% endblock %}
+
+{% block content %}
+<div id="share-feedback" class="alert hidden" aria-live="polite"></div>
+
+<section class="share-summary-band" aria-label="分享概览">
+  <div class="share-summary-item">
+    <span>有效分享</span>
+    <strong id="share-summary-active">{{ share_summary.active_count }}</strong>
+    <small>当前仍可访问</small>
+  </div>
+  <div class="share-summary-item">
+    <span>今日访问</span>
+    <strong id="share-summary-today">{{ share_summary.today_access_count }}</strong>
+    <small>按公开页面访问统计</small>
+  </div>
+  <div class="share-summary-item share-summary-item-warning">
+    <span>即将过期</span>
+    <strong id="share-summary-expiring">{{ share_summary.expiring_soon_count }}</strong>
+    <small>未来 24 小时内</small>
+  </div>
+</section>
+
+<section id="share-create-panel" class="share-create-band hidden" aria-labelledby="share-create-title">
+  <div class="share-create-heading">
+    <div>
+      <h2 id="share-create-title">创建分享</h2>
+      <p>完整访问链接只在创建成功后显示一次。</p>
+    </div>
+    <button id="close-share-form" class="icon-button icon-button-bordered" type="button" aria-label="关闭创建表单" title="关闭">&times;</button>
+  </div>
+  <form id="share-create-form" class="share-create-form">
+    <label class="settings-field share-path-field" for="share-object-key">
+      <span>对象路径</span>
+      <input id="share-object-key" class="input-text" type="text" placeholder="docs/report.pdf" required>
+    </label>
+    <label class="settings-field" for="share-expires-hours">
+      <span>有效期</span>
+      <select id="share-expires-hours" class="input-select">
+        <option value="1">1 小时</option>
+        <option value="24" selected>24 小时</option>
+        <option value="72">3 天</option>
+        <option value="168">7 天</option>
+        <option value="720">30 天</option>
+      </select>
+    </label>
+    <label class="settings-field" for="share-password">
+      <span>访问密码 <small>可选</small></span>
+      <input id="share-password" class="input-text" type="password" autocomplete="new-password" minlength="4" placeholder="至少 4 个字符">
+    </label>
+    <label class="settings-field" for="share-download-limit">
+      <span>下载次数 <small>可选</small></span>
+      <input id="share-download-limit" class="input-text" type="number" min="1" max="1000000" step="1" placeholder="不限">
+    </label>
+    <div class="share-form-actions">
+      <button id="create-share-submit" class="button" type="submit">生成链接</button>
+    </div>
+  </form>
+  <div id="share-created-link" class="share-created-link hidden" aria-live="polite">
+    <label for="share-created-url">本次分享链接</label>
+    <div>
+      <input id="share-created-url" class="input-text" type="text" readonly>
+      <button id="copy-share-url" class="button button-secondary" type="button">复制链接</button>
+    </div>
+  </div>
+</section>
+
+<section class="share-panel">
+  <div class="share-panel-toolbar">
+    <div class="segmented-control" role="group" aria-label="筛选分享">
+      <button class="segment is-active" type="button" data-share-filter="all" aria-pressed="true">全部</button>
+      <button class="segment" type="button" data-share-filter="active" aria-pressed="false">有效</button>
+      <button class="segment" type="button" data-share-filter="inactive" aria-pressed="false">已结束</button>
+    </div>
+    <span id="share-count" class="muted">共 {{ share_summary.total_count }} 条记录</span>
+  </div>
+  <div class="share-table-header" aria-hidden="true">
+    <span>对象</span>
+    <span>状态</span>
+    <span>有效期</span>
+    <span>访问 / 下载</span>
+    <span>保护</span>
+    <span>操作</span>
+  </div>
+  <div id="share-list" class="share-list" aria-live="polite" aria-busy="true">
+    <div class="task-skeleton"><span></span><span></span><span></span></div>
+    <div class="task-skeleton"><span></span><span></span><span></span></div>
+  </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/shares.js?v=20260726-hifi-p4" defer></script>
+{% endblock %}

@@ -1,0 +1,120 @@
+{% extends "base.html" %}
+
+{% block title %}设置 · {{ app_title }}{% endblock %}
+{% block page_title %}设置{% endblock %}
+{% block page_description %}集中管理访问策略、对象存储信息、上传默认值与危险操作。{% endblock %}
+{% block page_actions %}
+<button id="validate-settings" class="button button-secondary" type="button">验证设置</button>
+<button id="save-settings" class="button" type="submit" form="settings-form">保存全部</button>
+{% endblock %}
+
+{% block content %}
+<div id="settings-feedback" class="alert hidden" aria-live="polite"></div>
+<form id="settings-form" class="settings-panel" aria-busy="true">
+  <section class="settings-section">
+    <div class="settings-section-heading">
+      <h2>认证与访问</h2>
+      <p>只读模式立即影响 Web UI；WebDAV 使用独立 Basic Auth。</p>
+    </div>
+    <div class="settings-fields">
+      <label class="toggle-field">
+        <span><strong>只读模式</strong><small>阻止上传、新建、重命名、删除和失败任务重试。</small></span>
+        <input id="read-only-mode" type="checkbox">
+        <span class="toggle-control" aria-hidden="true"></span>
+      </label>
+      <label class="toggle-field">
+        <span><strong>启用 WebDAV</strong><small>允许配置的客户端访问 `/webdav/`。</small></span>
+        <input id="webdav-enabled" type="checkbox">
+        <span class="toggle-control" aria-hidden="true"></span>
+      </label>
+      <div class="settings-grid two-settings-columns">
+        <label class="settings-field" for="webdav-username">
+          <span>WebDAV 用户名</span>
+          <input id="webdav-username" class="input-text" type="text" autocomplete="username">
+        </label>
+        <label class="settings-field" for="webdav-password">
+          <span>WebDAV 密码</span>
+          <input id="webdav-password" class="input-text" type="password" autocomplete="new-password" placeholder="留空则保持现有密码">
+          <small id="webdav-password-state">尚未设置</small>
+        </label>
+      </div>
+    </div>
+  </section>
+
+  <section class="settings-section">
+    <div class="settings-section-heading">
+      <h2>对象存储</h2>
+      <p>环境变量优先于本地设置；改动连接信息后建议重启服务。</p>
+    </div>
+    <div class="settings-fields settings-grid two-settings-columns">
+      <label class="settings-field" for="storage-namespace">
+        <span>Namespace <small id="source-namespace"></small></span>
+        <input id="storage-namespace" class="input-text" type="text">
+      </label>
+      <label class="settings-field" for="storage-bucket">
+        <span>Bucket <small id="source-bucket"></small></span>
+        <input id="storage-bucket" class="input-text" type="text">
+      </label>
+      <label class="settings-field" for="storage-region">
+        <span>Region <small id="source-region"></small></span>
+        <input id="storage-region" class="input-text" type="text" placeholder="例如 ap-singapore-1">
+      </label>
+      <label class="settings-field" for="storage-prefix-root">
+        <span>Prefix Root <small id="source-prefix-root"></small></span>
+        <input id="storage-prefix-root" class="input-text" type="text" placeholder="例如 team-assets/">
+      </label>
+    </div>
+  </section>
+
+  <section class="settings-section">
+    <div class="settings-section-heading">
+      <h2>上传默认值</h2>
+      <p>用于新建的 server-proxy 入桶任务，现有任务继续使用创建时参数。</p>
+    </div>
+    <div class="settings-fields settings-grid three-settings-columns">
+      <label class="settings-field" for="upload-chunk-size">
+        <span>分片大小 <small>MB</small></span>
+        <input id="upload-chunk-size" class="input-text" type="number" min="8" max="512" step="1">
+        <small id="source-chunk-size"></small>
+      </label>
+      <label class="settings-field" for="upload-parallelism">
+        <span>并发数</span>
+        <input id="upload-parallelism" class="input-text" type="number" min="1" max="32" step="1">
+        <small id="source-parallelism"></small>
+      </label>
+      <label class="settings-field" for="upload-threshold">
+        <span>单 PUT 阈值 <small>MB</small></span>
+        <input id="upload-threshold" class="input-text" type="number" min="1" max="5120" step="1">
+        <small id="source-threshold"></small>
+      </label>
+    </div>
+  </section>
+
+  <section class="settings-section settings-section-danger">
+    <div class="settings-section-heading">
+      <h2>危险操作</h2>
+      <p>删除与批量操作保护。回收站启用后会先复制对象到 `.trash/`。</p>
+    </div>
+    <div class="settings-fields">
+      <label class="toggle-field">
+        <span><strong>启用回收站</strong><small>删除前复制对象并记录原路径，复制成功后才删除原对象。</small></span>
+        <input id="trash-enabled" type="checkbox">
+        <span class="toggle-control" aria-hidden="true"></span>
+      </label>
+      <label class="toggle-field">
+        <span><strong>批量删除二次确认</strong><small>前端要求确认对象数量；后端仍逐项返回成功与失败。</small></span>
+        <input id="batch-confirmation-required" type="checkbox">
+        <span class="toggle-control" aria-hidden="true"></span>
+      </label>
+      <div class="maintenance-row">
+        <span><strong>清理过期临时文件</strong><small>复用上传清理服务，不清理活跃任务。</small></span>
+        <button id="cleanup-temp-files" class="button button-secondary button-inline" type="button">立即清理</button>
+      </div>
+    </div>
+  </section>
+</form>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/js/settings.js?v=20260726-hifi-p3" defer></script>
+{% endblock %}

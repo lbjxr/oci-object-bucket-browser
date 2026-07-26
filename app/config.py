@@ -14,6 +14,11 @@ class Settings:
     namespace: str
     bucket_name: str
     compartment_id: str | None
+    region: str = ""
+    prefix_root: str = ""
+    settings_file: str = "./tmp/settings.json"
+    trash_record_file: str = "./tmp/trash_records.json"
+    share_file: str = "./tmp/shares.json"
     preview_text_limit: int = 20000
     max_list_limit: int = 200
     auth_username: str = "admin"
@@ -31,7 +36,7 @@ class Settings:
     upload_cleanup_startup_enabled: bool = True
     upload_cleanup_scheduler_enabled: bool = True
     upload_cleanup_interval_seconds: int = 3600
-    upload_completed_task_visible_seconds: float = 1.0
+    upload_completed_task_visible_seconds: float = 86400.0
     upload_cleanup_completed_retention_hours: int = 24
     upload_cleanup_failed_retention_hours: int = 72
     upload_cleanup_stale_staging_retention_hours: int = 24
@@ -49,6 +54,11 @@ def get_settings() -> Settings:
         namespace=namespace,
         bucket_name=bucket_name,
         compartment_id=compartment_id,
+        region=os.getenv("OCI_REGION", "").strip(),
+        prefix_root=os.getenv("OCI_PREFIX_ROOT", "").strip().strip("/"),
+        settings_file=os.getenv("APP_SETTINGS_FILE", "./tmp/settings.json").strip() or "./tmp/settings.json",
+        trash_record_file=os.getenv("APP_TRASH_RECORD_FILE", "./tmp/trash_records.json").strip() or "./tmp/trash_records.json",
+        share_file=os.getenv("APP_SHARE_FILE", "./tmp/shares.json").strip() or "./tmp/shares.json",
         preview_text_limit=int(os.getenv("OCI_PREVIEW_TEXT_LIMIT", "20000")),
         max_list_limit=int(os.getenv("OCI_MAX_LIST_LIMIT", "200")),
         auth_username=os.getenv("APP_AUTH_USERNAME", "admin").strip() or "admin",
@@ -66,7 +76,7 @@ def get_settings() -> Settings:
         upload_cleanup_startup_enabled=os.getenv("APP_UPLOAD_CLEANUP_STARTUP_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
         upload_cleanup_scheduler_enabled=os.getenv("APP_UPLOAD_CLEANUP_SCHEDULER_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"},
         upload_cleanup_interval_seconds=max(1, int(os.getenv("APP_UPLOAD_CLEANUP_INTERVAL_SECONDS", "3600"))),
-        upload_completed_task_visible_seconds=max(0.0, float(os.getenv("APP_UPLOAD_COMPLETED_TASK_VISIBLE_SECONDS", "1.0"))),
+        upload_completed_task_visible_seconds=max(0.0, float(os.getenv("APP_UPLOAD_COMPLETED_TASK_VISIBLE_SECONDS", "86400"))),
         upload_cleanup_completed_retention_hours=max(0, int(os.getenv("APP_UPLOAD_CLEANUP_COMPLETED_RETENTION_HOURS", "24"))),
         upload_cleanup_failed_retention_hours=max(0, int(os.getenv("APP_UPLOAD_CLEANUP_FAILED_RETENTION_HOURS", "72"))),
         upload_cleanup_stale_staging_retention_hours=max(1, int(os.getenv("APP_UPLOAD_CLEANUP_STALE_STAGING_RETENTION_HOURS", "24"))),

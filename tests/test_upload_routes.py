@@ -114,6 +114,22 @@ class DummyUploadTaskManager:
         if self.task and self.task.task_id == task_id:
             self.task.status = 'canceled'
             return self.task
+
+    def retry(self, task_id):
+        if self.task and self.task.task_id == task_id:
+            if self.task.status != 'failed':
+                raise ValueError('只有失败任务可以手动重试')
+            self.task.status = 'queued'
+            self.task.phase = 'manual_retry_queued'
+            self.task.error = None
+            return self.task
+
+    def clear_completed(self):
+        if self.task and self.task.status == 'completed':
+            self.task = None
+            self.task_store.task = None
+            return 1
+        return 0
         return None
 
 
@@ -128,10 +144,19 @@ def make_client(tmp_path: Path):
     os.environ['APP_SESSION_SECRET'] = 'test-session-secret-for-smoke'
     os.environ['APP_UPLOAD_SESSION_DIR'] = str(tmp_path / 'upload-sessions')
     os.environ['APP_UPLOAD_TEMP_DIR'] = str(tmp_path / 'upload-staging')
+    os.environ['APP_SETTINGS_FILE'] = str(tmp_path / 'app-settings.json')
+    os.environ['APP_TRASH_RECORD_FILE'] = str(tmp_path / 'trash-records.json')
+    os.environ['APP_SHARE_FILE'] = str(tmp_path / 'shares.json')
     os.environ['APP_UPLOAD_CHUNK_SIZE_MB'] = '8'
     os.environ['APP_UPLOAD_SINGLE_PUT_THRESHOLD_MB'] = '4'
     os.environ['APP_UPLOAD_PARALLELISM'] = '3'
     get_settings.cache_clear()
+    from app.settings_store import reset_app_settings_store
+    from app.share_store import reset_share_store
+    from app.trash_store import reset_trash_record_store
+    reset_app_settings_store()
+    reset_share_store()
+    reset_trash_record_store()
 
     class FakeStorage:
         def __init__(self):
@@ -431,6 +456,51 @@ def test_list_files_api_returns_folder_and_file_split(tmp_path):
     assert [item['name'] for item in payload['breadcrumbs']] == ['Bucket 根目录', 'docs']
     assert [item['name'] for item in payload['folders']] == ['sub']
     assert [item['name'] for item in payload['files']] == ['docs/a.txt']
+
+
+def test_file_list_api_supports_search_type_filter_and_pagination(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
+    fake_storage.object_entries = [
+        type('Obj', (), {'name': 'docs/report.pdf', 'size': 6 * 1024 * 1024, 'etag': 'etag-pdf', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'application/pdf'})(),
+        type('Obj', (), {'name': 'docs/readme.txt', 'size': 128, 'etag': 'etag-text', 'time_created': '2026-04-22T10:00:00+00:00', 'content_type': 'text/plain'})(),
+    ]
+
+    response = client.get('/api/files?prefix=docs/&query=report&file_type=pdf&size_min=5&page_size=10')
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [item['name'] for item in payload['files']] == ['docs/report.pdf']
+    assert payload['files'][0]['file_type'] == 'pdf'
+    assert payload['pagination']['total_items'] == 1
+    assert payload['pagination']['page'] == 1
+
+
+def test_index_renders_hifi_file_workspace(tmp_path):
+    client, fake_storage, _ = make_client(tmp_path)
+    fake_storage.object_entries = []
+
+    response = client.get('/')
+
+    assert response.status_code == 200
+    html = response.text
+    assert 'class="app-shell"' in html
+    assert 'href="/uploads"' in html
+    assert 'id="upload-panel-toggle"' in html
+    assert 'class="file-filter-bar"' in html
+    assert 'id="file-detail-panel"' in html
+
+
+def test_uploads_page_renders_independent_task_workspace(tmp_path):
+    client, _fake_storage, _manager = make_client(tmp_path)
+
+    response = client.get('/uploads')
+
+    assert response.status_code == 200
+    html = response.text
+    assert '上传任务' in html
+    assert 'id="summary-active"' in html
+    assert 'id="tasks-page-list"' in html
+    assert '/static/js/uploads.js' in html
 
 
 
@@ -1242,7 +1312,7 @@ def test_batch_delete_objects_success(tmp_path):
     client, fake_storage, _ = make_client(tmp_path)
     response = client.post(
         '/objects/batch-delete',
-        json={'object_names': ['alpha.txt', 'folder/beta.txt', 'alpha.txt']},
+        json={'object_names': ['alpha.txt', 'folder/beta.txt', 'alpha.txt'], 'confirmation_count': 2},
     )
     assert response.status_code == 200
     payload = response.json()
@@ -1258,7 +1328,7 @@ def test_batch_delete_objects_trims_empty_names_and_preserves_first_seen_order(t
     client, fake_storage, _ = make_client(tmp_path)
     response = client.post(
         '/objects/batch-delete',
-        json={'object_names': ['  ', 'gamma.txt', ' alpha.txt ', 'gamma.txt', '', 'alpha.txt']},
+        json={'object_names': ['  ', 'gamma.txt', ' alpha.txt ', 'gamma.txt', '', 'alpha.txt'], 'confirmation_count': 2},
     )
     assert response.status_code == 200
     payload = response.json()
@@ -1279,7 +1349,7 @@ def test_batch_delete_objects_partial_failure(tmp_path):
     fake_storage.delete_hook = selective_delete
     response = client.post(
         '/objects/batch-delete',
-        json={'object_names': ['alpha.txt', 'folder/beta.txt', 'gamma.txt']},
+        json={'object_names': ['alpha.txt', 'folder/beta.txt', 'gamma.txt'], 'confirmation_count': 3},
     )
     assert response.status_code == 207
     payload = response.json()
@@ -1303,7 +1373,7 @@ def test_batch_delete_objects_failure_when_all_fail(tmp_path):
     fake_storage.delete_hook = always_fail
     response = client.post(
         '/objects/batch-delete',
-        json={'object_names': ['alpha.txt', 'beta.txt']},
+        json={'object_names': ['alpha.txt', 'beta.txt'], 'confirmation_count': 2},
     )
     assert response.status_code == 500
     payload = response.json()

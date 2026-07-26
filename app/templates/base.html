@@ -3,27 +3,95 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
   <title>{% block title %}{{ app_title }}{% endblock %}</title>
-  <link rel="stylesheet" href="/static/css/app.css?v=20260424-2238">
+  <link rel="stylesheet" href="/static/css/app.css?v=20260726-hifi-p1-2">
 </head>
 <body>
-  <div class="page-shell">
-    {% if is_authenticated %}
-    <header class="topbar card">
-      <div>
-        <a href="/" class="brand">☁️ {{ app_title }}</a>
-        <p class="subtitle">轻量、清爽的 OCI 对象存储浏览器</p>
+  {% if is_authenticated and not force_public|default(false) %}
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <a href="/" class="product-lockup" aria-label="Bucket Browser 首页">
+        <span class="product-mark" aria-hidden="true">B</span>
+        <span>
+          <strong>Bucket Browser</strong>
+          <small>OCI Object Storage</small>
+        </span>
+      </a>
+
+      <nav class="primary-nav">
+        <a class="nav-item{% if active_path == '/' %} is-active{% endif %}" href="/">
+          <span class="nav-icon" aria-hidden="true">F</span>
+          <span>文件</span>
+        </a>
+        <a class="nav-item{% if active_path == '/uploads' %} is-active{% endif %}" href="/uploads">
+          <span class="nav-icon" aria-hidden="true">U</span>
+          <span>上传任务</span>
+        </a>
+        <a class="nav-item{% if active_path == '/shares' %} is-active{% endif %}" href="/shares">
+          <span class="nav-icon" aria-hidden="true">S</span>
+          <span>分享</span>
+        </a>
+        <a class="nav-item{% if active_path == '/stats' %} is-active{% endif %}" href="/stats">
+          <span class="nav-icon" aria-hidden="true">D</span>
+          <span>存储统计</span>
+        </a>
+        <a class="nav-item{% if active_path == '/settings' %} is-active{% endif %}" href="/settings">
+          <span class="nav-icon" aria-hidden="true">C</span>
+          <span>设置</span>
+        </a>
+      </nav>
+
+      <div class="bucket-context">
+        <span class="context-label">当前 Bucket</span>
+        <strong title="{{ bucket_name or '未配置' }}">{{ bucket_name or '未配置' }}</strong>
+        <span title="{{ namespace or '未配置 Namespace' }}">{{ namespace or '未配置 Namespace' }}</span>
       </div>
-      <div class="topbar-actions">
-        <span class="welcome">已登录：{{ auth_username }}</span>
+
+      <div class="sidebar-user">
+        <span class="user-avatar" aria-hidden="true">{{ auth_username[:1]|upper }}</span>
+        <span class="user-copy">
+          <strong>{{ auth_username }}</strong>
+          <small>管理员</small>
+        </span>
         <form action="/logout" method="post">
-          <button class="button button-secondary" type="submit">退出登录</button>
+          <button class="icon-button" type="submit" title="退出登录" aria-label="退出登录">&#x2192;</button>
         </form>
       </div>
-    </header>
-    {% endif %}
+    </aside>
 
-    {% block content %}{% endblock %}
+    <main class="workspace">
+      <header class="workspace-header">
+        <div class="workspace-heading">
+          <h1>{% block page_title %}{% endblock %}</h1>
+          <p>{% block page_description %}{% endblock %}</p>
+        </div>
+        <div class="workspace-actions">
+          {% block page_actions %}{% endblock %}
+        </div>
+      </header>
+      <div class="workspace-content">
+        {% block content %}{% endblock %}
+      </div>
+    </main>
   </div>
+  {% else %}
+  <main class="public-shell">
+    {% block public_content %}{% block content_unauthenticated %}{% endblock %}{% endblock %}
+  </main>
+  {% endif %}
+  {% block scripts %}{% endblock %}
+  {% if is_authenticated and not force_public|default(false) %}
+  <script>
+    (() => {
+      const revealActiveNavigation = () => {
+        if (!window.matchMedia('(max-width: 900px)').matches) return;
+        document.querySelector('.primary-nav .nav-item.is-active')?.scrollIntoView({block: 'nearest', inline: 'nearest'});
+      };
+      window.addEventListener('resize', revealActiveNavigation, {passive: true});
+      revealActiveNavigation();
+    })();
+  </script>
+  {% endif %}
 </body>
 </html>

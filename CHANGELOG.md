@@ -5,10 +5,28 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Shared application shell with responsive navigation, upgraded file table, filters, pagination, upload workbench, and object detail sidebar.
+- Dedicated upload task dashboard with summaries, filters, retry, cancel, failure details, polling, and completed-task cleanup.
+- Persistent settings page for storage, upload defaults, read-only mode, WebDAV credentials, recycle-bin behavior, and batch-delete confirmation.
+- Recycle-bin delete flow that copies objects under `.trash/`, records the operation locally, then removes the source object.
+- Share management with hashed tokens, PBKDF2 password protection, expiry, revocation, access counters, and atomic download limits.
+- Public share landing and download routes that do not expose OCI credentials.
+- Storage statistics page and refresh API for size, object count, recent uploads, and type distribution.
+- WebDAV Basic Auth support for OPTIONS, PROPFIND, GET, PUT, DELETE, MKCOL, and MOVE.
+- Independent tests for file filtering, upload summaries, settings, recycle-bin behavior, sharing, storage statistics, and WebDAV protocol rules.
 
 ### Changed
+- Completed upload tasks remain visible for 24 hours by default so the upload dashboard can present meaningful recent history.
+- Object-writing Web UI and WebDAV routes now share the same server-side read-only policy.
+- Batch delete can require an exact selected-object count confirmation in both the browser and API request.
+- OCI storage statistics can scan all paginated object-list responses instead of only the first page.
+- High-fidelity implementation and feature documents now serve as the P1-P5 regression baseline.
+- High-fidelity documents are organized under `docs/` and now distinguish completed implementation from future scope.
 
 ### Known limitations
+- Settings, recycle-bin records, and share records use local JSON files and assume a single application instance.
+- Storage statistics are synchronous and may be slow for very large buckets.
+- WebDAV implements the planned first-version method subset; advanced locking, property mutation, and multi-status error bodies are not included.
 
 ## [v1.0.0] - 2026-04-22
 

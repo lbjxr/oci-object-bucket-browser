@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import csv
 import hashlib
 import json
 import secrets
 import tempfile
 import zipfile
+from contextlib import closing
 from dataclasses import dataclass
-from datetime import datetime
-from io import BytesIO
+from datetime import datetime, timedelta, timezone
+from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
@@ -18,12 +20,19 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 from app.config import get_settings
+from app.file_browser import FileBrowserQuery, classify_file_type, filter_and_paginate
 from app.oci_client import OCIStorageError, OCIStorageService, classify_upload_exception
+from app.settings_store import get_app_settings_store
+from app.share_store import ShareAccessError, get_share_store, public_share, share_status, summarize_shares, utc_now
+from app.storage_stats import summarize_objects
 from app.temp_uploads import TempUploadSessionStore, UploadedChunk
+from app.trash_store import RecycleBinService, get_trash_record_store
+from app.upload_dashboard import summarize_upload_tasks
 from app.upload_cleanup import run_upload_cleanup
 from app.upload_sessions import UploadSession, UploadedPart, UploadSessionStore
 from app.upload_tasks import get_upload_task_manager
 from app.utils import is_image_type, is_pdf_type, is_text_type, object_name_from_upload, to_data_url
+from app.webdav import basic_auth_matches, build_multistatus, href_for, map_path, parse_destination, relative_from_key
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
@@ -120,11 +129,12 @@ def enrich_objects(objects):
         setattr(obj, "is_image", is_image_type(obj.content_type or ""))
         setattr(obj, "file_icon", file_icon_for(obj.content_type))
         setattr(obj, "file_type_label", file_type_label_for(obj.content_type))
+        setattr(obj, "file_type", classify_file_type(obj.content_type, obj.name))
     return objects
 
 
 def get_storage() -> OCIStorageService:
-    return OCIStorageService()
+    return OCIStorageService(get_app_settings_store().effective_settings())
 
 
 def get_upload_store() -> UploadSessionStore:
@@ -142,21 +152,33 @@ def require_login(request: Request) -> None:
         raise HTTPException(status_code=401, detail="未登录")
 
 
+def require_write_access(request: Request) -> None:
+    require_login(request)
+    if get_app_settings_store().read_only_enabled():
+        raise HTTPException(status_code=403, detail="只读模式已开启，当前操作会写入对象存储，已阻止")
+
+
 def redirect_to_login(next_path: str = "/") -> RedirectResponse:
     return RedirectResponse(url=f"/login?next={quote(next_path, safe='/?:=&')}", status_code=303)
 
 
 def template_context(request: Request, **extra: object) -> dict[str, object]:
-    settings = get_settings()
+    settings_store = get_app_settings_store()
+    settings = settings_store.effective_settings()
     return {
         "request": request,
         "app_title": "OCI Object Bucket Browser",
         "is_authenticated": bool(request.session.get("authenticated")),
         "auth_username": settings.auth_username,
+        "namespace": settings.namespace,
+        "bucket_name": settings.bucket_name,
+        "active_path": request.url.path,
         "upload_chunk_size_mb": settings.upload_chunk_size_mb,
         "upload_single_put_threshold_mb": settings.upload_single_put_threshold_mb,
         "upload_parallelism": settings.upload_parallelism,
         "upload_proxy_chunk_size_mb": settings.upload_proxy_chunk_size_mb,
+        "trash_enabled": settings_store.trash_enabled(),
+        "batch_delete_confirmation_required": settings_store.batch_delete_confirmation_required(),
         **extra,
     }
 
@@ -240,10 +262,18 @@ class UploadInitRequest(BaseModel):
 
 class BatchDeleteRequest(BaseModel):
     object_names: list[str]
+    confirmation_count: int | None = None
 
 
 class BatchDownloadRequest(BaseModel):
     object_names: list[str]
+
+
+class CreateShareRequest(BaseModel):
+    object_key: str
+    expires_in_hours: int = 24
+    password: str = ""
+    download_limit: int | None = None
 
 
 class ServerProxyUploadInitRequest(BaseModel):
@@ -433,11 +463,22 @@ def _build_batch_download_filename(prefix: str, object_count: int) -> str:
 
 def _copy_object_via_app(storage: OCIStorageService, *, source_name: str, destination_name: str) -> None:
     stream, content_type, _ = storage.open_stream(source_name)
-    storage.upload_file(destination_name, stream, content_type)
+    with closing(stream):
+        storage.upload_file(destination_name, stream, content_type)
 
 
 def _list_objects_for_prefix(storage: OCIStorageService, prefix: str) -> list[object]:
     return storage.list_objects(prefix=_normalize_prefix(prefix))
+
+
+def _build_storage_stats(prefix: str = "") -> dict:
+    normalized_prefix = _normalize_prefix(prefix)
+    storage = get_storage()
+    list_all = getattr(storage, "list_objects_all", None)
+    objects = list_all(prefix=normalized_prefix) if callable(list_all) else storage.list_objects(prefix=normalized_prefix)
+    payload = summarize_objects(objects, prefix=normalized_prefix)
+    payload["refreshed_at"] = datetime.now(timezone.utc).isoformat()
+    return payload
 
 
 def _object_exists(storage: OCIStorageService, object_name: str) -> bool:
@@ -568,7 +609,20 @@ def _rename_prefix(storage: OCIStorageService, *, source_prefix: str, destinatio
     return {"moved_count": moved}
 
 
-def _delete_prefix(storage: OCIStorageService, *, path_prefix: str) -> dict[str, int]:
+def _delete_object_with_policy(storage: OCIStorageService, *, object_name: str, deleted_by: str) -> dict[str, object]:
+    if not get_app_settings_store().trash_enabled():
+        storage.delete_object(object_name)
+        return {"object_name": object_name, "recycled": False, "trash_record": None}
+
+    record = RecycleBinService(storage, get_trash_record_store()).recycle(object_name, deleted_by=deleted_by)
+    return {
+        "object_name": object_name,
+        "recycled": True,
+        "trash_record": record,
+    }
+
+
+def _delete_prefix(storage: OCIStorageService, *, path_prefix: str, deleted_by: str) -> dict[str, object]:
     normalized_prefix = _normalize_prefix(path_prefix)
     if not normalized_prefix:
         raise HTTPException(status_code=400, detail="不允许删除根目录")
@@ -576,16 +630,278 @@ def _delete_prefix(storage: OCIStorageService, *, path_prefix: str) -> dict[str,
     if not objects:
         raise HTTPException(status_code=404, detail="目录不存在或目录下没有对象")
     deleted = 0
+    recycled = 0
     for obj in objects:
-        storage.delete_object(obj.name)
+        result = _delete_object_with_policy(storage, object_name=obj.name, deleted_by=deleted_by)
         deleted += 1
-    return {"deleted_count": deleted}
+        recycled += int(bool(result["recycled"]))
+    return {"deleted_count": deleted, "recycled_count": recycled}
 
 
 def _content_disposition_attachment(filename: str) -> str:
     ascii_fallback = filename.encode("ascii", errors="ignore").decode("ascii") or "download.bin"
     quoted = quote(filename)
     return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quoted}"
+
+
+def _share_is_authorized(request: Request, share_id: str) -> bool:
+    authorized = request.session.get("authorized_shares") or []
+    return share_id in authorized
+
+
+def _remember_share_authorization(request: Request, share_id: str) -> None:
+    authorized = [item for item in (request.session.get("authorized_shares") or []) if isinstance(item, str)]
+    if share_id not in authorized:
+        authorized.append(share_id)
+    request.session["authorized_shares"] = authorized[-20:]
+
+
+def _public_share_response(
+    request: Request,
+    *,
+    token: str,
+    record: dict | None,
+    error: str | None = None,
+    status_code: int = 200,
+):
+    share = public_share(record) if record is not None else None
+    password_required = bool(share and share["password_protected"] and not _share_is_authorized(request, share["id"]))
+    return templates.TemplateResponse(
+        request,
+        "share_public.html",
+        template_context(
+            request,
+            force_public=True,
+            share=share,
+            share_token=token,
+            password_required=password_required,
+            share_error=error,
+        ),
+        status_code=status_code,
+    )
+
+
+def _webdav_authenticate(request: Request) -> None:
+    enabled, configured_username, password_hash = get_app_settings_store().webdav_credentials()
+    if not enabled:
+        raise HTTPException(status_code=404, detail="WebDAV 未启用")
+    header = request.headers.get("authorization", "")
+    if not header.lower().startswith("basic "):
+        raise HTTPException(
+            status_code=401,
+            detail="需要 WebDAV Basic Auth",
+            headers={"WWW-Authenticate": 'Basic realm="OCI Object Bucket Browser"'},
+        )
+    if basic_auth_matches(header, username=configured_username, password_hash=password_hash):
+        return
+    raise HTTPException(
+        status_code=401,
+        detail="WebDAV 用户名或密码错误",
+        headers={"WWW-Authenticate": 'Basic realm="OCI Object Bucket Browser"'},
+    )
+
+
+def _webdav_require_write() -> None:
+    if get_app_settings_store().read_only_enabled():
+        raise HTTPException(status_code=403, detail="只读模式已开启，WebDAV 写操作已阻止")
+
+
+def _webdav_path(path: str | None) -> tuple[str, str, bool]:
+    prefix_root = get_app_settings_store().effective_settings().prefix_root
+    try:
+        mapped = map_path(path, prefix_root=prefix_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return mapped.key, mapped.relative, mapped.collection_hint
+
+
+def _webdav_relative_from_key(key: str) -> str:
+    return relative_from_key(key, prefix_root=get_app_settings_store().effective_settings().prefix_root)
+
+
+def _webdav_href(relative: str, *, collection: bool) -> str:
+    return href_for(relative, collection=collection)
+
+
+def _webdav_propfind(storage, *, path: str, depth: int) -> Response:
+    key, relative, collection_hint = _webdav_path(path)
+    root_key = _normalize_prefix(key)
+    exact_object = bool(key) and _object_exists(storage, key.rstrip("/"))
+    prefix_exists = bool(root_key) and _prefix_has_objects(storage, root_key)
+    is_collection = collection_hint or prefix_exists
+    if key and not exact_object and not prefix_exists:
+        raise HTTPException(status_code=404, detail="WebDAV 资源不存在")
+
+    resources: list[dict[str, object]] = []
+    if not is_collection:
+        info = storage.head_object(key)
+        resources.append(
+            {
+                "href": _webdav_href(relative, collection=False),
+                "collection": False,
+                "name": relative.rsplit("/", 1)[-1],
+                "size": info.size,
+                "content_type": info.content_type,
+                "etag": info.etag,
+            }
+        )
+    else:
+        collection_prefix = root_key
+        listed = storage.list_objects(prefix=collection_prefix)
+        resources.append(
+            {
+                "href": _webdav_href(relative, collection=True),
+                "collection": True,
+                "name": relative.rsplit("/", 1)[-1] if relative else "Bucket",
+            }
+        )
+        if depth > 0:
+            folders, files = _split_directory_entries(collection_prefix, listed)
+            for folder in folders:
+                child_relative = _webdav_relative_from_key(folder.full_prefix)
+                resources.append(
+                    {
+                        "href": _webdav_href(child_relative, collection=True),
+                        "collection": True,
+                        "name": folder.name,
+                    }
+                )
+            for obj in files:
+                child_relative = _webdav_relative_from_key(obj.name)
+                resources.append(
+                    {
+                        "href": _webdav_href(child_relative, collection=False),
+                        "collection": False,
+                        "name": child_relative.rsplit("/", 1)[-1],
+                        "size": getattr(obj, "size", None),
+                        "content_type": getattr(obj, "content_type", None),
+                        "etag": getattr(obj, "etag", None),
+                        "modified": getattr(obj, "time_created", None),
+                    }
+                )
+
+    body = build_multistatus(resources)
+    return Response(
+        content=body,
+        status_code=207,
+        media_type="application/xml; charset=utf-8",
+        headers={"DAV": "1, 2", "Content-Length": str(len(body))},
+    )
+
+
+def _webdav_destination(request: Request, destination: str) -> tuple[str, str, bool]:
+    try:
+        mapped = parse_destination(
+            destination,
+            current_netloc=request.url.netloc,
+            prefix_root=get_app_settings_store().effective_settings().prefix_root,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return mapped.key, mapped.relative, mapped.collection_hint
+
+
+@router.api_route("/webdav", methods=["OPTIONS", "PROPFIND", "GET", "PUT", "DELETE", "MKCOL", "MOVE"])
+@router.api_route("/webdav/{path:path}", methods=["OPTIONS", "PROPFIND", "GET", "PUT", "DELETE", "MKCOL", "MOVE"])
+async def webdav_endpoint(request: Request, path: str = ""):
+    _webdav_authenticate(request)
+    method = request.method.upper()
+    if method == "OPTIONS":
+        return Response(
+            status_code=200,
+            headers={
+                "Allow": "OPTIONS, PROPFIND, GET, PUT, DELETE, MKCOL, MOVE",
+                "DAV": "1, 2",
+                "MS-Author-Via": "DAV",
+            },
+        )
+
+    storage = get_storage()
+    if method == "PROPFIND":
+        depth_header = request.headers.get("depth", "1").strip().lower()
+        depth = 0 if depth_header == "0" else 1
+        return _webdav_propfind(storage, path=path, depth=depth)
+
+    key, relative, collection_hint = _webdav_path(path)
+    if method == "GET":
+        if collection_hint or not key or not _object_exists(storage, key):
+            raise HTTPException(status_code=404, detail="WebDAV 文件不存在")
+        try:
+            stream, content_type, upstream_headers = storage.open_stream(key)
+        except OCIStorageError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        headers = {"Content-Disposition": _content_disposition_attachment(relative.rsplit("/", 1)[-1])}
+        if upstream_headers.get("content-length"):
+            headers["Content-Length"] = upstream_headers["content-length"]
+        if upstream_headers.get("etag"):
+            headers["ETag"] = upstream_headers["etag"]
+        return StreamingResponse(stream, media_type=content_type, headers=headers)
+
+    _webdav_require_write()
+    if method == "PUT":
+        if not key or collection_hint:
+            raise HTTPException(status_code=400, detail="PUT 目标必须是文件路径")
+        existed = _object_exists(storage, key)
+        body = await request.body()
+        try:
+            storage.upload_file(key, BytesIO(body), request.headers.get("content-type"))
+        except OCIStorageError as exc:
+            raise HTTPException(status_code=500, detail=f"WebDAV PUT 失败：{exc}") from exc
+        return Response(status_code=204 if existed else 201, headers={"Content-Length": "0"})
+
+    if method == "DELETE":
+        if not key:
+            raise HTTPException(status_code=400, detail="不允许删除 WebDAV 根目录")
+        if collection_hint or _prefix_has_objects(storage, _normalize_prefix(key)):
+            _delete_prefix(storage, path_prefix=key, deleted_by="webdav")
+        elif _object_exists(storage, key):
+            _delete_object_with_policy(storage, object_name=key, deleted_by="webdav")
+        else:
+            raise HTTPException(status_code=404, detail="WebDAV 资源不存在")
+        return Response(status_code=204, headers={"Content-Length": "0"})
+
+    if method == "MKCOL":
+        if not key:
+            raise HTTPException(status_code=400, detail="MKCOL 目标必须是目录路径")
+        folder_object = _ensure_folder_object_name(key)
+        if _object_exists(storage, folder_object) or _prefix_has_objects(storage, folder_object):
+            raise HTTPException(status_code=405, detail="WebDAV 目录已存在")
+        try:
+            storage.upload_file(folder_object, BytesIO(b""), "application/x-directory")
+        except OCIStorageError as exc:
+            raise HTTPException(status_code=500, detail=f"WebDAV MKCOL 失败：{exc}") from exc
+        return Response(status_code=201, headers={"Content-Length": "0"})
+
+    if method == "MOVE":
+        destination = request.headers.get("destination", "").strip()
+        if not destination:
+            raise HTTPException(status_code=400, detail="MOVE 缺少 Destination 头")
+        destination_key, destination_relative, destination_collection_hint = _webdav_destination(request, destination)
+        if not key or key == destination_key:
+            raise HTTPException(status_code=403, detail="MOVE 源和目标不能相同")
+        source_collection = collection_hint or _prefix_has_objects(storage, _normalize_prefix(key))
+        overwrite = request.headers.get("overwrite", "T").strip().upper() != "F"
+        destination_exists = (
+            _object_exists(storage, destination_key.rstrip("/"))
+            or _prefix_has_objects(storage, _normalize_prefix(destination_key))
+        )
+        if destination_exists and not overwrite:
+            raise HTTPException(status_code=412, detail="MOVE 目标已存在且不允许覆盖")
+        if destination_exists and overwrite:
+            if _prefix_has_objects(storage, _normalize_prefix(destination_key)):
+                _delete_prefix(storage, path_prefix=destination_key, deleted_by="webdav")
+            elif _object_exists(storage, destination_key.rstrip("/")):
+                _delete_object_with_policy(storage, object_name=destination_key.rstrip("/"), deleted_by="webdav")
+        if source_collection:
+            result = _rename_prefix(storage, source_prefix=key, destination_prefix=destination_key)
+        else:
+            if not _object_exists(storage, key):
+                raise HTTPException(status_code=404, detail="MOVE 源不存在")
+            _rename_single_object(storage, source_name=key, destination_name=destination_key.rstrip("/"))
+            result = {"moved_count": 1}
+        return Response(status_code=204 if destination_exists else 201, headers={"Content-Length": "0"})
+
+    raise HTTPException(status_code=405, detail="不支持的 WebDAV 方法")
 
 
 def _parse_single_range_header(range_header: str | None, *, total_size: int) -> SingleRangeRequest | None:
@@ -674,22 +990,42 @@ def logout(request: Request):
 
 
 @router.get("/", response_class=HTMLResponse)
-def index(request: Request, prefix: str = ""):
+def index(
+    request: Request,
+    prefix: str = "",
+    query: str = "",
+    file_type: str = "all",
+    size_min: float | None = Query(default=None, ge=0),
+    size_max: float | None = Query(default=None, ge=0),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=10, le=100),
+):
     if not request.session.get("authenticated"):
         return redirect_to_login(request.url.path + (f"?prefix={quote(prefix)}" if prefix else ""))
     normalized_prefix = _normalize_prefix(prefix)
     breadcrumbs = _build_prefix_breadcrumbs(normalized_prefix)
     current_directory_label = normalized_prefix or "/"
+    filters = FileBrowserQuery(
+        query=query,
+        file_type=file_type,
+        size_min_mb=size_min,
+        size_max_mb=size_max,
+        page=page,
+        page_size=page_size,
+    )
     try:
         listed_objects = _list_objects_for_prefix(get_storage(), normalized_prefix)
         folders, files = _split_directory_entries(normalized_prefix, enrich_objects(listed_objects))
+        file_page = filter_and_paginate(folders, files, filters)
         return templates.TemplateResponse(
             request,
             "index.html",
             template_context(
                 request,
-                objects=files,
-                folders=folders,
+                objects=file_page.files,
+                folders=file_page.folders,
+                file_page=file_page,
+                filters=filters,
                 prefix=normalized_prefix,
                 current_prefix=normalized_prefix,
                 current_directory_label=current_directory_label,
@@ -700,6 +1036,7 @@ def index(request: Request, prefix: str = ""):
             ),
         )
     except OCIStorageError as exc:
+        file_page = filter_and_paginate([], [], filters)
         return templates.TemplateResponse(
             request,
             "index.html",
@@ -707,6 +1044,8 @@ def index(request: Request, prefix: str = ""):
                 request,
                 objects=[],
                 folders=[],
+                file_page=file_page,
+                filters=filters,
                 prefix=normalized_prefix,
                 current_prefix=normalized_prefix,
                 current_directory_label=current_directory_label,
@@ -719,6 +1058,321 @@ def index(request: Request, prefix: str = ""):
         )
 
 
+@router.get("/uploads", response_class=HTMLResponse)
+def uploads_page(request: Request):
+    if not request.session.get("authenticated"):
+        return redirect_to_login("/uploads")
+    tasks = get_upload_task_manager().task_store.list_recent(limit=100)
+    summary = summarize_upload_tasks(tasks)
+    return templates.TemplateResponse(
+        request,
+        "uploads.html",
+        template_context(
+            request,
+            tasks=tasks,
+            task_summary=summary,
+        ),
+    )
+
+
+@router.get("/shares", response_class=HTMLResponse)
+def shares_page(request: Request):
+    if not request.session.get("authenticated"):
+        return redirect_to_login("/shares")
+    records = get_share_store().list_records()
+    return templates.TemplateResponse(
+        request,
+        "shares.html",
+        template_context(
+            request,
+            share_summary=summarize_shares(records),
+        ),
+    )
+
+
+@router.get("/api/shares")
+def list_shares_api(request: Request):
+    require_login(request)
+    records = sorted(
+        get_share_store().list_records(),
+        key=lambda item: str(item.get("created_at") or ""),
+        reverse=True,
+    )
+    return {
+        "ok": True,
+        "summary": summarize_shares(records),
+        "shares": [public_share(record) for record in records],
+    }
+
+
+@router.post("/api/shares")
+def create_share_api(request: Request, payload: CreateShareRequest = Body(...)):
+    require_login(request)
+    object_key = _normalize_path(payload.object_key)
+    if not object_key or object_key.endswith("/"):
+        raise HTTPException(status_code=400, detail="分享对象路径必须指向一个文件")
+    if not 1 <= payload.expires_in_hours <= 8760:
+        raise HTTPException(status_code=422, detail="有效期必须在 1-8760 小时之间")
+    if payload.download_limit is not None and not 1 <= payload.download_limit <= 1_000_000:
+        raise HTTPException(status_code=422, detail="下载次数限制必须在 1-1000000 之间")
+    password = payload.password.strip()
+    if password and len(password) < 4:
+        raise HTTPException(status_code=422, detail="分享密码至少需要 4 个字符")
+    if len(password) > 256:
+        raise HTTPException(status_code=422, detail="分享密码不能超过 256 个字符")
+
+    try:
+        get_storage().head_object(object_key)
+    except OCIStorageError as exc:
+        raise HTTPException(status_code=404, detail=f"无法创建分享：{exc}") from exc
+
+    now = utc_now()
+    record, token = get_share_store().create(
+        object_key=object_key,
+        expires_at=now + timedelta(hours=payload.expires_in_hours),
+        download_limit=payload.download_limit,
+        password=password,
+        now=now,
+    )
+    share_url = f"{str(request.base_url).rstrip('/')}/s/{quote(token, safe='')}"
+    return {
+        "ok": True,
+        "message": "分享链接已创建。出于安全考虑，该完整链接只返回这一次。",
+        "share": public_share(record, now=now),
+        "share_url": share_url,
+    }
+
+
+@router.delete("/api/shares/{share_id}")
+def revoke_share_api(request: Request, share_id: str):
+    require_login(request)
+    try:
+        record = get_share_store().revoke(share_id)
+    except ShareAccessError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "message": "分享链接已撤销",
+        "share": public_share(record),
+    }
+
+
+@router.get("/api/shares-export")
+def export_shares_api(request: Request):
+    require_login(request)
+    records = sorted(
+        get_share_store().list_records(),
+        key=lambda item: str(item.get("created_at") or ""),
+        reverse=True,
+    )
+    buffer = StringIO(newline="")
+    writer = csv.writer(buffer)
+    writer.writerow(["ID", "对象路径", "状态", "创建时间", "过期时间", "访问次数", "下载次数", "下载限制", "密码保护"])
+    for record in records:
+        item = public_share(record)
+        writer.writerow(
+            [
+                item["id"],
+                item["object_key"],
+                item["status"],
+                item["created_at"],
+                item["expires_at"],
+                item["access_count"],
+                item["download_count"],
+                item["download_limit"] if item["download_limit"] is not None else "",
+                "是" if item["password_protected"] else "否",
+            ]
+        )
+    filename = f"oci-shares-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+    return Response(
+        content="\ufeff" + buffer.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": _content_disposition_attachment(filename)},
+    )
+
+
+@router.get("/stats", response_class=HTMLResponse)
+def stats_page(request: Request, prefix: str = ""):
+    if not request.session.get("authenticated"):
+        return redirect_to_login("/stats")
+    try:
+        summary = _build_storage_stats(prefix)
+        error = None
+    except OCIStorageError as exc:
+        summary = summarize_objects([], prefix=_normalize_prefix(prefix))
+        summary["refreshed_at"] = None
+        error = str(exc)
+    return templates.TemplateResponse(
+        request,
+        "stats.html",
+        template_context(request, storage_summary=summary, stats_error=error),
+        status_code=500 if error else 200,
+    )
+
+
+@router.get("/api/stats/summary")
+def storage_stats_api(request: Request, prefix: str = ""):
+    require_login(request)
+    try:
+        summary = _build_storage_stats(prefix)
+    except OCIStorageError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"ok": True, "summary": summary}
+
+
+@router.post("/api/stats/refresh")
+def refresh_storage_stats_api(request: Request, prefix: str = ""):
+    require_login(request)
+    try:
+        summary = _build_storage_stats(prefix)
+    except OCIStorageError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return {"ok": True, "message": "存储统计已刷新", "summary": summary}
+
+
+@router.get("/settings", response_class=HTMLResponse)
+def settings_page(request: Request):
+    if not request.session.get("authenticated"):
+        return redirect_to_login("/settings")
+    return templates.TemplateResponse(
+        request,
+        "settings.html",
+        template_context(request),
+    )
+
+
+@router.get("/s/{token}", response_class=HTMLResponse)
+def public_share_page(request: Request, token: str):
+    store = get_share_store()
+    record = store.get_by_token(token)
+    if record is None:
+        return _public_share_response(
+            request,
+            token=token,
+            record=None,
+            error="分享链接不存在或地址不完整",
+            status_code=404,
+        )
+    status_value = share_status(record)
+    if status_value != "active":
+        message = {
+            "revoked": "该分享链接已撤销",
+            "expired": "该分享链接已过期",
+            "exhausted": "该分享链接的下载次数已用完",
+        }.get(status_value, "该分享链接当前不可用")
+        return _public_share_response(
+            request,
+            token=token,
+            record=record,
+            error=message,
+            status_code=410,
+        )
+    try:
+        record = store.record_access(record["id"])
+    except ShareAccessError as exc:
+        return _public_share_response(
+            request,
+            token=token,
+            record=record,
+            error=str(exc),
+            status_code=exc.status_code,
+        )
+    return _public_share_response(request, token=token, record=record)
+
+
+@router.post("/s/{token}/verify-password", response_class=HTMLResponse)
+def verify_public_share_password(request: Request, token: str, password: str = Form(...)):
+    store = get_share_store()
+    try:
+        record = store.require_active(token)
+    except ShareAccessError as exc:
+        record = store.get_by_token(token)
+        return _public_share_response(
+            request,
+            token=token,
+            record=record,
+            error=str(exc),
+            status_code=exc.status_code,
+        )
+    if not store.password_matches(record, password):
+        return _public_share_response(
+            request,
+            token=token,
+            record=record,
+            error="分享密码错误",
+            status_code=401,
+        )
+    _remember_share_authorization(request, record["id"])
+    return RedirectResponse(url=f"/s/{quote(token, safe='')}", status_code=303)
+
+
+@router.get("/s/{token}/download")
+def download_public_share(request: Request, token: str):
+    store = get_share_store()
+    try:
+        record = store.require_active(token)
+    except ShareAccessError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    if record.get("password_hash") and not _share_is_authorized(request, record["id"]):
+        return RedirectResponse(url=f"/s/{quote(token, safe='')}", status_code=303)
+
+    try:
+        stream, content_type, upstream_headers = get_storage().open_stream(record["object_key"])
+    except OCIStorageError as exc:
+        raise HTTPException(status_code=404, detail=f"分享对象读取失败：{exc}") from exc
+    try:
+        store.reserve_download(record["id"])
+    except ShareAccessError as exc:
+        stream.close()
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    except Exception:
+        stream.close()
+        raise
+
+    filename = str(record["object_key"]).split("/")[-1] or "download.bin"
+    headers = {
+        "Content-Disposition": _content_disposition_attachment(filename),
+        "Cache-Control": "private, no-store",
+    }
+    if upstream_headers.get("content-length"):
+        headers["Content-Length"] = upstream_headers["content-length"]
+    if upstream_headers.get("etag"):
+        headers["ETag"] = upstream_headers["etag"]
+    return StreamingResponse(stream, media_type=content_type, headers=headers)
+
+
+@router.get("/api/settings")
+def get_app_settings_api(request: Request):
+    require_login(request)
+    return {"ok": True, "settings": get_app_settings_store().public_snapshot()}
+
+
+@router.post("/api/settings/validate")
+def validate_app_settings_api(request: Request, payload: dict = Body(...)):
+    require_login(request)
+    try:
+        normalized = get_app_settings_store().validate_update(payload)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    normalized["webdav"]["password"] = "" if not normalized["webdav"]["password"] else "configured"
+    return {"ok": True, "message": "设置格式有效", "normalized": normalized}
+
+
+@router.post("/api/settings")
+def save_app_settings_api(request: Request, payload: dict = Body(...)):
+    require_login(request)
+    try:
+        saved = get_app_settings_store().update(payload)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "message": "设置已保存。只读模式立即生效，存储与上传参数在服务重启后应用。",
+        "restart_required": True,
+        "settings": saved,
+    }
+
+
 @router.post("/upload")
 async def upload(request: Request, file: UploadFile = File(...), overwrite: bool = Form(False)):
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
@@ -726,6 +1380,7 @@ async def upload(request: Request, file: UploadFile = File(...), overwrite: bool
         if is_ajax:
             return JSONResponse({"detail": "未登录"}, status_code=401)
         return redirect_to_login(request.url.path)
+    require_write_access(request)
     if not file.filename:
         raise HTTPException(status_code=400, detail="缺少文件名")
     object_name = object_name_from_upload(file.filename)
@@ -757,7 +1412,7 @@ async def upload(request: Request, file: UploadFile = File(...), overwrite: bool
 
 @router.post("/api/server-uploads/init")
 async def init_server_upload(request: Request, payload: ServerProxyUploadInitRequest = Body(...)):
-    require_login(request)
+    require_write_access(request)
     settings = get_settings()
     if not payload.filename.strip():
         raise HTTPException(status_code=400, detail="缺少文件名")
@@ -861,7 +1516,7 @@ async def stage_server_upload_chunk(
     chunk_sha256: str | None = Query(default=None),
     body: bytes = Body(...),
 ):
-    require_login(request)
+    require_write_access(request)
     temp_store = get_temp_upload_store()
     session = temp_store.get(temp_upload_id)
     if not session:
@@ -927,7 +1582,7 @@ async def stage_server_upload_chunk(
 
 @router.post("/api/server-uploads/commit")
 async def commit_server_upload(request: Request, payload: ServerProxyCommitRequest = Body(...), temp_upload_id: str = Query(...)):
-    require_login(request)
+    require_write_access(request)
     temp_store = get_temp_upload_store()
     session = temp_store.get(temp_upload_id)
     if not session:
@@ -988,6 +1643,7 @@ async def list_server_upload_tasks(request: Request, limit: int = Query(default=
     tasks = get_upload_task_manager().task_store.list_recent(limit=limit)
     return {
         "ok": True,
+        "summary": summarize_upload_tasks(tasks).to_dict(),
         "tasks": [
             {
                 **task.to_api_dict(),
@@ -1020,6 +1676,34 @@ async def cancel_server_upload_task(request: Request, task_id: str):
     return {"ok": True, "task_id": task_id, "status": task.status, "message": "已请求取消上传任务"}
 
 
+@router.post("/api/server-uploads/tasks/{task_id}/cancel")
+async def cancel_server_upload_task_post(request: Request, task_id: str):
+    return await cancel_server_upload_task(request, task_id)
+
+
+@router.post("/api/server-uploads/tasks/{task_id}/retry")
+async def retry_server_upload_task(request: Request, task_id: str):
+    require_write_access(request)
+    try:
+        task = get_upload_task_manager().retry(task_id)
+    except (ValueError, FileNotFoundError, RuntimeError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if not task:
+        raise HTTPException(status_code=404, detail="上传任务不存在")
+    return {"ok": True, "task_id": task_id, "status": task.status, "message": "失败任务已重新排队"}
+
+
+@router.post("/api/server-uploads/tasks/cleanup-completed")
+async def clear_completed_server_upload_tasks(request: Request):
+    require_login(request)
+    deleted_count = get_upload_task_manager().clear_completed()
+    return {
+        "ok": True,
+        "deleted_count": deleted_count,
+        "message": f"已清理 {deleted_count} 个完成任务",
+    }
+
+
 @router.post("/api/server-uploads/cleanup")
 async def run_server_upload_cleanup(request: Request):
     require_login(request)
@@ -1034,7 +1718,7 @@ async def run_server_upload_cleanup(request: Request):
 
 @router.post("/api/uploads/init")
 async def init_upload(request: Request, payload: UploadInitRequest = Body(...)):
-    require_login(request)
+    require_write_access(request)
     settings = get_settings()
     if not payload.filename.strip():
         raise HTTPException(status_code=400, detail="缺少文件名")
@@ -1116,7 +1800,7 @@ async def init_upload(request: Request, payload: UploadInitRequest = Body(...)):
 
 @router.put("/api/uploads/{upload_id}/part/{part_num}")
 async def upload_part(request: Request, response: Response, upload_id: str, part_num: int, body: bytes = Body(...)):
-    require_login(request)
+    require_write_access(request)
     if part_num <= 0:
         raise HTTPException(status_code=400, detail="part_num 必须从 1 开始")
 
@@ -1216,7 +1900,7 @@ async def get_upload_status(request: Request, upload_id: str):
 
 @router.post("/api/uploads/{upload_id}/complete")
 async def complete_upload(request: Request, upload_id: str):
-    require_login(request)
+    require_write_access(request)
     store = get_upload_store()
     session = store.get(upload_id)
     if not session:
@@ -1421,12 +2105,33 @@ async def batch_download_objects(request: Request, prefix: str = Query(default="
 
 
 @router.get("/api/files")
-def list_files_api(request: Request, prefix: str = ""):
+def list_files_api(
+    request: Request,
+    prefix: str = "",
+    query: str = "",
+    file_type: str = "all",
+    size_min: float | None = Query(default=None, ge=0),
+    size_max: float | None = Query(default=None, ge=0),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=25, ge=10, le=100),
+):
     require_login(request)
     normalized_prefix = _normalize_prefix(prefix)
     try:
         listed_objects = _list_objects_for_prefix(get_storage(), normalized_prefix)
         folders, files = _split_directory_entries(normalized_prefix, enrich_objects(listed_objects))
+        file_page = filter_and_paginate(
+            folders,
+            files,
+            FileBrowserQuery(
+                query=query,
+                file_type=file_type,
+                size_min_mb=size_min,
+                size_max_mb=size_max,
+                page=page,
+                page_size=page_size,
+            ),
+        )
     except OCIStorageError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -1436,6 +2141,22 @@ def list_files_api(request: Request, prefix: str = ""):
         "current_directory_label": normalized_prefix or "/",
         "parent_prefix": _parent_prefix(normalized_prefix),
         "breadcrumbs": _build_prefix_breadcrumbs(normalized_prefix),
+        "pagination": {
+            "page": file_page.page,
+            "page_size": file_page.page_size,
+            "total_items": file_page.total_items,
+            "total_pages": file_page.total_pages,
+            "start_item": file_page.start_item,
+            "end_item": file_page.end_item,
+            "has_previous": file_page.has_previous,
+            "has_next": file_page.has_next,
+        },
+        "filters": {
+            "query": query,
+            "file_type": file_type,
+            "size_min": size_min,
+            "size_max": size_max,
+        },
         "folders": [
             {
                 "name": folder.name,
@@ -1443,7 +2164,7 @@ def list_files_api(request: Request, prefix: str = ""):
                 "item_count": folder.item_count,
                 "placeholder_exists": folder.placeholder_exists,
             }
-            for folder in folders
+            for folder in file_page.folders
         ],
         "files": [
             {
@@ -1454,15 +2175,17 @@ def list_files_api(request: Request, prefix: str = ""):
                 "time_display": getattr(obj, "time_display", format_time_to_seconds(obj.time_created)),
                 "content_type": obj.content_type,
                 "file_type_label": getattr(obj, "file_type_label", file_type_label_for(obj.content_type)),
+                "file_type": getattr(obj, "file_type", classify_file_type(obj.content_type, obj.name)),
+                "etag": obj.etag,
             }
-            for obj in files
+            for obj in file_page.files
         ],
     }
 
 
 @router.post("/api/files/folders")
 def create_folder(request: Request, payload: CreateFolderRequest = Body(...)):
-    require_login(request)
+    require_write_access(request)
     folder_name = (payload.folder_name or "").strip().strip("/")
     if not folder_name:
         raise HTTPException(status_code=400, detail="目录名不能为空")
@@ -1490,7 +2213,7 @@ def create_folder(request: Request, payload: CreateFolderRequest = Body(...)):
 
 @router.post("/api/files/rename")
 def rename_path(request: Request, payload: RenamePathRequest = Body(...)):
-    require_login(request)
+    require_write_access(request)
     source_path = _normalize_path(payload.source_path)
     new_name = (payload.new_name or "").strip().strip("/")
     if not source_path:
@@ -1552,31 +2275,49 @@ def rename_path(request: Request, payload: RenamePathRequest = Body(...)):
 
 @router.post("/api/files/delete")
 def delete_path(request: Request, payload: DeletePathRequest = Body(...)):
-    require_login(request)
+    require_write_access(request)
     path = (payload.path or "").strip()
     if not path:
         raise HTTPException(status_code=400, detail="路径不能为空")
     storage = get_storage()
     try:
         if path.endswith("/"):
-            result = _delete_prefix(storage, path_prefix=path)
+            result = _delete_prefix(storage, path_prefix=path, deleted_by="web-ui")
+            recycled = result["recycled_count"] > 0
             return {
                 "ok": True,
                 "kind": "folder",
                 "path": _normalize_prefix(path),
                 "deleted_count": result["deleted_count"],
-                "message": f"目录已删除：{_normalize_prefix(path)}",
+                "recycled_count": result["recycled_count"],
+                "message": (
+                    f"目录已移入回收站：{_normalize_prefix(path)}"
+                    if recycled
+                    else f"目录已删除：{_normalize_prefix(path)}"
+                ),
             }
-        storage.delete_object(_normalize_path(path))
+        result = _delete_object_with_policy(
+            storage,
+            object_name=_normalize_path(path),
+            deleted_by="web-ui",
+        )
         return {
             "ok": True,
             "kind": "file",
             "path": _normalize_path(path),
-            "message": f"文件已删除：{_normalize_path(path)}",
+            "recycled": result["recycled"],
+            "trash_key": result["trash_record"]["trash_key"] if result["trash_record"] else None,
+            "message": (
+                f"文件已移入回收站：{_normalize_path(path)}"
+                if result["recycled"]
+                else f"文件已删除：{_normalize_path(path)}"
+            ),
         }
     except HTTPException:
         raise
     except OCIStorageError as exc:
+        raise HTTPException(status_code=500, detail=f"删除失败：{exc}") from exc
+    except Exception as exc:
         raise HTTPException(status_code=500, detail=f"删除失败：{exc}") from exc
 
 
@@ -1584,20 +2325,36 @@ def delete_path(request: Request, payload: DeletePathRequest = Body(...)):
 def batch_delete_objects(request: Request, payload: BatchDeleteRequest = Body(...)):
     if not request.session.get("authenticated"):
         return JSONResponse({"detail": "未登录"}, status_code=401)
+    require_write_access(request)
 
     object_names = _normalize_object_names(payload.object_names)
 
     if not object_names:
         raise HTTPException(status_code=400, detail="至少要选择一个对象")
 
+    confirmation_required = get_app_settings_store().batch_delete_confirmation_required()
+    if confirmation_required and payload.confirmation_count != len(object_names):
+        raise HTTPException(
+            status_code=400,
+            detail=f"批量删除需要输入所选对象数量 {len(object_names)} 进行确认",
+        )
+
     storage = get_storage()
     deleted = []
+    recycled = []
     failed = []
 
     for object_name in object_names:
         try:
-            storage.delete_object(object_name)
+            result = _delete_object_with_policy(storage, object_name=object_name, deleted_by="web-ui-batch")
             deleted.append(object_name)
+            if result["recycled"]:
+                recycled.append(
+                    {
+                        "object_name": object_name,
+                        "trash_key": result["trash_record"]["trash_key"],
+                    }
+                )
         except OCIStorageError as exc:
             failed.append({"object_name": object_name, "detail": str(exc)})
         except Exception as exc:
@@ -1616,6 +2373,7 @@ def batch_delete_objects(request: Request, payload: BatchDeleteRequest = Body(..
             "deleted_count": deleted_count,
             "failed_count": failed_count,
             "deleted": deleted,
+            "recycled": recycled,
             "failed": failed,
             "message": message,
             "detail": detail,
@@ -1638,6 +2396,7 @@ def batch_delete_objects(request: Request, payload: BatchDeleteRequest = Body(..
             "deleted_count": deleted_count,
             "failed_count": failed_count,
             "deleted": deleted,
+            "recycled": recycled,
             "failed": failed,
             "message": message,
             "detail": detail,
@@ -1650,9 +2409,14 @@ def batch_delete_objects(request: Request, payload: BatchDeleteRequest = Body(..
 def delete_object(request: Request, object_name: str):
     if not request.session.get("authenticated"):
         return JSONResponse({"detail": "未登录"}, status_code=401)
+    require_write_access(request)
 
     try:
-        get_storage().delete_object(object_name)
+        result = _delete_object_with_policy(
+            get_storage(),
+            object_name=object_name,
+            deleted_by="web-ui",
+        )
     except OCIStorageError as exc:
         detail = str(exc)
         raise HTTPException(
@@ -1668,8 +2432,18 @@ def delete_object(request: Request, object_name: str):
     return {
         "ok": True,
         "object_name": object_name,
-        "message": f"已删除对象：{object_name}",
-        "detail": f"对象“{object_name}”已从 bucket 中移除。",
+        "recycled": result["recycled"],
+        "trash_key": result["trash_record"]["trash_key"] if result["trash_record"] else None,
+        "message": (
+            f"已移入回收站：{object_name}"
+            if result["recycled"]
+            else f"已删除对象：{object_name}"
+        ),
+        "detail": (
+            f"对象“{object_name}”已复制到回收站并从原路径移除。"
+            if result["recycled"]
+            else f"对象“{object_name}”已从 bucket 中移除。"
+        ),
     }
 
 

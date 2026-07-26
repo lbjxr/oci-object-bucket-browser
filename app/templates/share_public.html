@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+
+{% block title %}对象分享 · {{ app_title }}{% endblock %}
+
+{% block public_content %}
+<section class="share-public-layout">
+  <div class="share-public-brand">
+    <span class="product-mark" aria-hidden="true">B</span>
+    <span><strong>Bucket Browser</strong><small>安全对象分享</small></span>
+  </div>
+  <article class="share-public-card">
+    {% if share %}
+    <div class="share-public-object-mark" aria-hidden="true">F</div>
+    <p class="eyebrow">Shared object</p>
+    <h1>{{ share.object_name or '共享对象' }}</h1>
+    <p class="share-public-path">{{ share.object_key }}</p>
+    <dl class="share-public-meta">
+      <div><dt>有效期至</dt><dd>{{ share.expires_at[:19]|replace('T', ' ') }} UTC</dd></div>
+      <div><dt>剩余下载</dt><dd>{% if share.remaining_downloads is none %}不限{% else %}{{ share.remaining_downloads }} 次{% endif %}</dd></div>
+    </dl>
+    {% else %}
+    <div class="share-public-object-mark is-error" aria-hidden="true">!</div>
+    <h1>链接不可用</h1>
+    {% endif %}
+
+    {% if share_error %}
+    <div class="alert alert-error">{{ share_error }}</div>
+    {% elif password_required %}
+    <form class="stack-form share-password-form" action="/s/{{ share_token }}/verify-password" method="post">
+      <label class="field-label" for="share-access-password">访问密码</label>
+      <input id="share-access-password" class="input-text" type="password" name="password" autocomplete="current-password" required autofocus>
+      <button class="button" type="submit">验证密码</button>
+    </form>
+    {% elif share %}
+    <a class="button share-download-button" href="/s/{{ share_token }}/download">下载文件</a>
+    {% endif %}
+  </article>
+</section>
+{% endblock %}

@@ -267,6 +267,26 @@ def test_server_proxy_task_cancel_endpoint(tmp_path):
     assert manager.task.status == 'canceled'
 
 
+def test_server_proxy_task_retry_and_cleanup_endpoints(tmp_path):
+    from tests.test_upload_routes import make_client
+
+    client, _fake_storage, manager = make_client(tmp_path)
+    manager.task.status = 'failed'
+    manager.task.phase = 'error'
+    manager.task.error = 'timeout'
+
+    retry_response = client.post('/api/server-uploads/tasks/task-1/retry')
+    assert retry_response.status_code == 200
+    assert manager.task.status == 'queued'
+    assert manager.task.error is None
+
+    manager.task.status = 'completed'
+    cleanup_response = client.post('/api/server-uploads/tasks/cleanup-completed')
+    assert cleanup_response.status_code == 200
+    assert cleanup_response.json()['deleted_count'] == 1
+    assert manager.task is None
+
+
 def test_server_proxy_commit_rejects_duplicate_commit_for_same_temp_upload(tmp_path):
     from tests.test_upload_routes import make_client
 
