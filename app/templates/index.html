@@ -173,7 +173,7 @@
       <div class="object-row-shell folder-row-shell">
         <div class="object-row-main">
           <div class="object-main">
-            <div class="object-name">📁 {{ folder.name }}/</div>
+            <div class="object-name">{{ folder.name }}/</div>
             <div class="object-subline">
               <span>目录</span>
               <span class="dot-sep">•</span>
@@ -186,7 +186,7 @@
           </div>
         </div>
         <div class="object-thumb-wrap">
-          <div class="object-file-icon" aria-label="目录">📁</div>
+          <div class="object-file-icon" role="img" aria-label="目录">📁</div>
         </div>
       </div>
       <div class="object-toolbar">
@@ -228,7 +228,7 @@
           {% if obj.is_image %}
           <img class="object-thumb" src="/thumb/{{ obj.name }}" alt="{{ obj.name }}">
           {% else %}
-          <div class="object-file-icon" aria-label="{{ obj.content_type or '未知类型' }}">{{ obj.file_icon }}</div>
+          <div class="object-file-icon" role="img" aria-label="{{ obj.content_type or '未知类型' }}">{{ obj.file_icon }}</div>
           {% endif %}
         </div>
       </div>
@@ -571,7 +571,7 @@
       <div class="object-row-shell folder-row-shell">
         <div class="object-row-main">
           <div class="object-main">
-            <div class="object-name">📁 ${escapeHtml(folder.name)}/</div>
+            <div class="object-name">${escapeHtml(folder.name)}/</div>
             <div class="object-subline">
               <span>目录</span>
               <span class="dot-sep">•</span>
@@ -580,7 +580,7 @@
             </div>
           </div>
         </div>
-        <div class="object-thumb-wrap"><div class="object-file-icon" aria-label="目录">📁</div></div>
+        <div class="object-thumb-wrap"><div class="object-file-icon" role="img" aria-label="目录">📁</div></div>
       </div>
       <div class="object-toolbar">
         <a class="toolbar-link" href="/?prefix=${encodeURIComponent(folder.full_prefix)}">打开</a>
@@ -620,7 +620,7 @@
           </div>
           <span class="object-size-badge">${escapeHtml(file.size_display || '')}</span>
         </div>
-        <div class="object-thumb-wrap"><div class="object-file-icon" aria-label="文件">📄</div></div>
+        <div class="object-thumb-wrap"><div class="object-file-icon" role="img" aria-label="文件">📄</div></div>
       </div>
       <div class="object-toolbar">
         <a class="toolbar-link" href="/view/${file.name}">预览</a>

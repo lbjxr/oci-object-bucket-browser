@@ -1576,6 +1576,7 @@ code {
 
 .object-row-card {
   position: relative;
+  min-width: 0;
   gap: 0 14px;
   min-height: 66px;
   padding: 9px 20px;
@@ -1617,19 +1618,32 @@ code {
 
 .object-main {
   display: block;
+  min-width: 0;
   grid-column: 1;
   grid-row: 1;
 }
 
 .object-name {
+  min-width: 0;
   padding-left: 30px;
   font-size: 0.88rem;
+  overflow-wrap: anywhere;
+}
+
+.object-row-card[data-object-kind="file"] .object-name {
+  padding-left: 58px;
 }
 
 .object-subline {
+  min-width: 0;
   padding-left: 30px;
   color: var(--muted);
   font-size: 0.72rem;
+  overflow-wrap: anywhere;
+}
+
+.object-row-card[data-object-kind="file"] .object-subline {
+  padding-left: 58px;
 }
 
 .object-select-control {
@@ -1667,7 +1681,7 @@ code {
 }
 
 [data-object-kind="folder"] .object-thumb-wrap {
-  display: none;
+  display: flex;
 }
 
 .object-file-icon {
@@ -1677,6 +1691,7 @@ code {
 .object-toolbar {
   grid-column: 4;
   grid-row: 1;
+  min-width: 0;
   justify-content: flex-end;
   gap: 4px;
   padding: 0;
@@ -1695,6 +1710,13 @@ code {
 
 .toolbar-link:hover {
   background: var(--surface-hover);
+}
+
+.nav-item:focus-visible,
+.toolbar-link:focus-visible,
+.breadcrumb-item:focus-visible {
+  outline: 2px solid #8bd4b5;
+  outline-offset: 2px;
 }
 
 .toolbar-link-danger {
@@ -1974,7 +1996,8 @@ code {
 
   .file-table-header,
   .object-row-card {
-    grid-template-columns: minmax(220px, 1fr) 82px 132px minmax(218px, auto);
+    grid-template-columns: minmax(140px, 1fr) 74px 116px minmax(172px, auto);
+    column-gap: 8px;
   }
 }
 
@@ -2051,6 +2074,9 @@ code {
     justify-content: flex-start;
     padding-left: 28px;
   }
+  .object-row-card[data-object-kind="file"] .object-toolbar {
+    padding-left: 58px;
+  }
 
   .object-select-control {
     left: 13px;
@@ -2069,6 +2095,11 @@ code {
   .object-name,
   .object-subline {
     padding-left: 26px;
+  }
+
+  .object-row-card[data-object-kind="file"] .object-name,
+  .object-row-card[data-object-kind="file"] .object-subline {
+    padding-left: 58px;
   }
 
   .file-pagination {
