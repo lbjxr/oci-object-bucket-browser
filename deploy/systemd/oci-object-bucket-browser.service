@@ -1,0 +1,22 @@
+[Unit]
+Description=OCI Object Bucket Browser
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=oci-browser
+Group=oci-browser
+WorkingDirectory=/opt/oci-object-bucket-browser-dev
+EnvironmentFile=/etc/oci-object-bucket-browser.env
+ExecStart=/opt/oci-object-bucket-browser-dev/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 25103 --workers 1
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/oci-object-bucket-browser-dev/tmp
+
+[Install]
+WantedBy=multi-user.target

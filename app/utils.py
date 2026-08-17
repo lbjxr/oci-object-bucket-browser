@@ -36,4 +36,12 @@ def to_data_url(content_type: str, payload: bytes) -> str:
 
 
 def object_name_from_upload(filename: str) -> str:
-    return PurePosixPath(filename).as_posix().lstrip("/")
+    raw = (filename or "").strip()
+    if "\\" in raw:
+        raise ValueError("文件名不允许反斜杠")
+    if any(part == ".." for part in raw.split("/")):
+        raise ValueError("文件名不允许上级目录")
+    normalized = PurePosixPath("/" + raw).as_posix().lstrip("/")
+    if normalized in {"", "."}:
+        raise ValueError("文件名不能为空")
+    return normalized

@@ -40,6 +40,20 @@ class OCIStorageError(RuntimeError):
         self.retry_after_seconds = retry_after_seconds
 
 
+def public_storage_error(exc: Exception, *, action: str = "存储操作") -> str:
+    status_code = int(getattr(exc, "status_code", 500) or 500)
+    category = str(getattr(exc, "category", "unknown") or "unknown")
+    if status_code == 404:
+        return f"{action}对象不存在或已不可用。"
+    if status_code in {401, 403}:
+        return f"{action}被对象存储拒绝，请检查 OCI 配置和权限。"
+    if status_code == 429 or category == "http_429":
+        return f"{action}请求过于频繁，请稍后重试。"
+    if status_code == 408 or category in {"timeout", "connection", "http_5xx"} or status_code >= 500:
+        return f"{action}服务暂时不可用，请稍后重试。"
+    return f"{action}失败，请稍后重试。"
+
+
 def _coerce_retry_after_seconds(value: object) -> int | None:
     if value is None:
         return None

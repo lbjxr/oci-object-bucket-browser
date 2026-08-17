@@ -206,6 +206,8 @@ OCI_REGION=
 OCI_PREFIX_ROOT=
 OCI_PREVIEW_TEXT_LIMIT=20000
 OCI_MAX_LIST_LIMIT=200
+APP_ENV=development
+APP_SESSION_HTTPS_ONLY=false
 
 APP_AUTH_USERNAME=your_admin_username
 APP_AUTH_PASSWORD=your_admin_password_here
@@ -221,6 +223,10 @@ APP_UPLOAD_SESSION_DIR=./tmp/upload_sessions
 APP_UPLOAD_TASK_DIR=./tmp/upload_tasks
 APP_UPLOAD_TEMP_DIR=./tmp/upload_staging
 APP_UPLOAD_PROXY_CHUNK_SIZE_MB=8
+APP_UPLOAD_MAX_FILE_SIZE_MB=5120
+APP_UPLOAD_MAX_CHUNK_SIZE_MB=64
+APP_UPLOAD_MAX_STAGING_MB=20480
+APP_UPLOAD_MAX_ACTIVE_TASKS=100
 APP_UPLOAD_CLEANUP_ENABLED=true
 APP_UPLOAD_CLEANUP_STARTUP_ENABLED=true
 APP_UPLOAD_CLEANUP_SCHEDULER_ENABLED=true
@@ -238,6 +244,8 @@ APP_UPLOAD_CLEANUP_STALE_STAGING_RETENTION_HOURS=24
 - `APP_AUTH_USERNAME`：固定登录用户名
 - `APP_AUTH_PASSWORD`：固定登录密码
 - `APP_SESSION_SECRET`：session 签名密钥
+- `APP_ENV`：运行环境；设为 `production` 后启用生产凭据启动检查
+- `APP_SESSION_HTTPS_ONLY`：是否为 Session Cookie 设置 `Secure`；生产默认 `true`，本地 HTTP 开发可显式设为 `false`
 - `APP_SETTINGS_FILE`：设置页保存的本地 JSON；同名环境变量配置始终优先
 - `APP_TRASH_RECORD_FILE`：回收站操作记录 JSON；默认位于 `./tmp/trash_records.json`
 - `APP_SHARE_FILE`：分享记录 JSON；默认位于 `./tmp/shares.json`，其中只保存 token hash 与密码 hash
@@ -254,8 +262,18 @@ APP_UPLOAD_CLEANUP_STALE_STAGING_RETENTION_HOURS=24
 - `APP_UPLOAD_CLEANUP_INTERVAL_SECONDS`：后台定时清理间隔，默认 `3600` 秒
 - `APP_UPLOAD_COMPLETED_TASK_VISIBLE_SECONDS`：成功入桶后 completed 任务在任务列表里继续展示多久再自动删除，默认 `86400` 秒（24 小时）
 - `APP_UPLOAD_CLEANUP_COMPLETED_RETENTION_HOURS`：已完成任务保留多久后再清理任务元数据 / staging 元数据 / upload session，默认 24 小时
+- `APP_UPLOAD_MAX_FILE_SIZE_MB`：单个上传文件大小上限，默认 5120 MB
+- `APP_UPLOAD_MAX_CHUNK_SIZE_MB`：单个上传 chunk 请求体上限，默认 64 MB
+- `APP_UPLOAD_MAX_STAGING_MB`：本地 staging 预留总量上限，默认 20480 MB
+- `APP_UPLOAD_MAX_ACTIVE_TASKS`：同时保留的未提交 staging 会话 / 后台任务上限，默认 100
 - `APP_UPLOAD_CLEANUP_FAILED_RETENTION_HOURS`：失败或取消任务保留多久后再清理任务元数据和残留 staging 文件，默认 72 小时
 - `APP_UPLOAD_CLEANUP_STALE_STAGING_RETENTION_HOURS`：未提交、长期无更新的 staging 会话保留多久后清理，默认 24 小时
+
+本项目的本地 JSON、上传任务和 staging 锁只支持单实例单 Worker。生产启动会拒绝 `APP_WORKERS`、`WEB_CONCURRENCY`、`UVICORN_WORKERS` 或 `GUNICORN_WORKERS` 大于 1 的配置；多副本需要先设计共享状态后再部署。
+
+登录、分享密码和 WebDAV Basic Auth 的失败限流默认按来源地址执行，5 次失败后在 300 秒窗口内返回 `429`；成功认证会清零对应计数。该限流只存在单进程内存，重启会清零，多实例必须由反向代理或共享存储限流。
+
+安全部署时将 `APP_ENV` 设置为 `production`。生产启动会拒绝默认密码、默认 Session Secret 以及少于 32 个字符的 Session Secret；生产环境默认启用 `APP_SESSION_HTTPS_ONLY=true`。本地 HTTP 开发可保留 `APP_ENV=development` 和 `APP_SESSION_HTTPS_ONLY=false`。
 
 设置页可持久化只读模式、对象存储展示值、上传默认值、WebDAV 凭据和危险操作策略。WebDAV 密码只保存 PBKDF2 hash，API 不返回 hash 或明文。启用回收站后，单对象、目录和批量删除会先把对象复制到 `.trash/{timestamp}/{original_key}`，写入本地操作记录，再删除原路径；复制或记录失败时不会删除源对象。批量删除二次确认开启时，客户端必须提交与去重后对象数量一致的 `confirmation_count`。
 
@@ -275,41 +293,50 @@ APP_UPLOAD_CLEANUP_STALE_STAGING_RETENTION_HOURS=24
 
 ### 方式一：systemd 服务（推荐）
 
-本项目已配置 systemd 服务文件，可直接安装并启动：
+仓库提供可安装的 `deploy/systemd/oci-object-bucket-browser.service`，固定单 Worker，避免本地 JSON 状态在多进程下互相覆盖。服务文件使用 `/opt/oci-object-bucket-browser-dev`、`oci-browser` 用户和 `/etc/oci-object-bucket-browser.env`，如部署路径不同必须同步修改服务文件。
+服务文件将 Home 目录设置为只读以允许读取 OCI 配置；请确保 `OCI_CONFIG_PATH` 指向 `oci-browser` 可读的配置文件，并将私钥权限限制为该用户。当前环境为 Windows，未执行 Linux systemd 实机启动，目标主机必须额外验证服务用户读取 OCI 配置和 `/healthz`。
 
 ```bash
-# 1. 安装依赖
-cd /path/to/oci-object-bucket-browser
-source .venv/bin/activate
+# 1. 将项目安装到固定目录并创建运行用户
+sudo useradd --system --home /opt/oci-object-bucket-browser-dev --shell /usr/sbin/nologin oci-browser || true
+sudo mkdir -p /opt/oci-object-bucket-browser-dev/tmp
+sudo chown -R oci-browser:oci-browser /opt/oci-object-bucket-browser-dev
+
+# 2. 安装依赖并准备生产环境文件
+cd /opt/oci-object-bucket-browser-dev
+python3 -m venv .venv
+. .venv/bin/activate
 pip install -r requirements.txt
+sudo install -o root -g oci-browser -m 0640 /dev/null /etc/oci-object-bucket-browser.env
+sudoedit /etc/oci-object-bucket-browser.env
+# 至少设置 APP_ENV=production、APP_AUTH_PASSWORD、APP_SESSION_SECRET（不少于 32 字符）、
+# APP_SESSION_HTTPS_ONLY=true，以及 OCI 配置项。
 
-# 2. 配置环境变量
-# 编辑 .env，填入正确的 OCI 配置（参考 .env.example）
-
-# 3. 安装 systemd 服务
+# 3. 安装并启动 systemd 服务
 sudo cp deploy/systemd/oci-object-bucket-browser.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable oci-object-bucket-browser.service
-sudo systemctl start oci-object-bucket-browser.service
+sudo systemctl enable --now oci-object-bucket-browser.service
 
-# 4. 检查状态
+# 4. 检查状态与健康入口
 sudo systemctl status oci-object-bucket-browser.service
+curl --fail http://127.0.0.1:25103/healthz
 ```
 
-服务默认监听 `0.0.0.0:25103`。
+服务只监听 `127.0.0.1:25103`，生产环境应由 HTTPS 反向代理对外提供访问。
 
 ### 方式二：手动启动
 
 ```bash
-cd /path/to/oci-object-bucket-browser
+cd /path/to/oci-object-bucket-browser-dev
 source .venv/bin/activate
 export $(grep -v '^#' .env | xargs)
-uvicorn app.main:app --host 0.0.0.0 --port 25103
+uvicorn app.main:app --host 0.0.0.0 --port 25103 --workers 1
 ```
 
 访问：
 
 - <http://127.0.0.1:25103>
+- <http://127.0.0.1:25103/healthz>
 
 ## 部署建议
 
@@ -614,26 +641,9 @@ python3 -m compileall app tests
 . .venv/bin/activate && pytest -q
 ```
 
-## systemd 示例
+## systemd 服务文件
 
-```ini
-[Unit]
-Description=OCI Object Bucket Browser
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=/path/to/oci-object-bucket-browser
-EnvironmentFile=/path/to/oci-object-bucket-browser/.env
-ExecStart=/path/to/oci-object-bucket-browser/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 25103
-Restart=always
-RestartSec=2
-User=root
-
-[Install]
-WantedBy=multi-user.target
-```
+请直接安装并维护仓库中的 `deploy/systemd/oci-object-bucket-browser.service`。该文件固定 `oci-browser` 非 root 用户、单 Worker、生产环境文件路径和本地状态目录权限；不要在 README 中复制另一份可能漂移的 unit 内容。
 
 - 不会侵入现有正式上传链
 

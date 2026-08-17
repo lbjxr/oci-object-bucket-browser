@@ -1,5 +1,5 @@
 from pathlib import Path
-
+import pytest
 
 def test_server_proxy_upload_init_stage_commit_and_status(tmp_path):
     from tests.test_upload_routes import make_client
@@ -332,3 +332,109 @@ def test_server_proxy_commit_rejects_duplicate_commit_for_same_temp_upload(tmp_p
     assert second_commit.status_code == 409
     assert second_commit.json()['detail'] == '临时上传已提交，请勿重复创建后台任务'
     assert len(manager.created) == 1
+
+def test_server_proxy_upload_rejects_file_size_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv('APP_UPLOAD_MAX_FILE_SIZE_MB', '1')
+    from tests.test_upload_routes import make_client
+
+    client, _fake_storage, _manager = make_client(tmp_path)
+    response = client.post(
+        '/api/server-uploads/init',
+        json={'filename': 'too-large.bin', 'file_size': 2 * 1024 * 1024, 'content_type': 'application/octet-stream'},
+    )
+
+    assert response.status_code == 413
+    assert '大小上限' in response.json()['detail']
+
+
+def test_server_proxy_upload_rejects_chunk_size_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv('APP_UPLOAD_MAX_CHUNK_SIZE_MB', '1')
+    from tests.test_upload_routes import make_client
+
+    client, _fake_storage, _manager = make_client(tmp_path)
+    init = client.post(
+        '/api/server-uploads/init',
+        json={'filename': 'chunk.bin', 'file_size': 8 * 1024 * 1024, 'content_type': 'application/octet-stream'},
+    )
+    temp_upload_id = init.json()['temp_upload_id']
+    response = client.put(
+        f'/api/server-uploads/staging/{temp_upload_id}?chunk_index=0',
+        content=b'x' * (2 * 1024 * 1024),
+        headers={'Content-Type': 'application/octet-stream'},
+    )
+
+    assert response.status_code == 413
+    assert 'chunk' in response.json()['detail']
+
+
+def test_server_proxy_upload_rejects_staging_quota(tmp_path, monkeypatch):
+    monkeypatch.setenv('APP_UPLOAD_MAX_STAGING_MB', '1')
+    from tests.test_upload_routes import make_client
+
+    client, _fake_storage, _manager = make_client(tmp_path)
+    first = client.post(
+        '/api/server-uploads/init',
+        json={'filename': 'staging-one.bin', 'file_size': 1 * 1024 * 1024, 'content_type': 'application/octet-stream'},
+    )
+    assert first.status_code == 200
+    second = client.post(
+        '/api/server-uploads/init',
+        json={'filename': 'staging-two.bin', 'file_size': 1 * 1024 * 1024, 'content_type': 'application/octet-stream'},
+    )
+
+    assert second.status_code == 413
+    assert '暂存空间' in second.json()['detail']
+
+def test_server_proxy_init_disk_failure_rolls_back_session(tmp_path, monkeypatch):
+    staging_dir = tmp_path / 'upload-staging'
+    from tests.test_upload_routes import make_client
+
+    client, _fake_storage, _manager = make_client(tmp_path)
+    original_write_bytes = Path.write_bytes
+
+    def fail_staging_write(path, data):
+        if path.parent == staging_dir.resolve():
+            raise OSError('disk full')
+        return original_write_bytes(path, data)
+
+    monkeypatch.setattr(Path, 'write_bytes', fail_staging_write)
+    response = client.post(
+        '/api/server-uploads/init',
+        json={'filename': 'disk-full.bin', 'file_size': 1 * 1024 * 1024, 'content_type': 'application/octet-stream'},
+    )
+
+    assert response.status_code == 507
+    assert list(staging_dir.glob('*.upload.json')) == []
+
+def test_temp_upload_store_atomically_reserves_staging_quota(tmp_path):
+    from app.temp_uploads import TempUploadSessionStore, UploadQuotaExceeded
+
+    store = TempUploadSessionStore(str(tmp_path / 'staging'))
+    store.create(
+        temp_upload_id='one',
+        filename='one.bin',
+        object_name='one.bin',
+        content_type='application/octet-stream',
+        total_size=10,
+        chunk_size=10,
+        strategy='single-put-server-proxy',
+        file_fingerprint='one',
+        staged_path=str(tmp_path / 'staging' / 'one.bin'),
+        max_staging_bytes=10,
+        max_active_sessions=2,
+    )
+
+    with pytest.raises(UploadQuotaExceeded):
+        store.create(
+            temp_upload_id='two',
+            filename='two.bin',
+            object_name='two.bin',
+            content_type='application/octet-stream',
+            total_size=1,
+            chunk_size=1,
+            strategy='single-put-server-proxy',
+            file_fingerprint='two',
+            staged_path=str(tmp_path / 'staging' / 'two.bin'),
+            max_staging_bytes=10,
+            max_active_sessions=2,
+        )

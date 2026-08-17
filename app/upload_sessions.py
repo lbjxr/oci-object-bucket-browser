@@ -124,7 +124,13 @@ class UploadSessionStore:
             created_at=now,
             updated_at=now,
         )
-        self.save(session)
+        try:
+            self.save(session)
+        except OSError:
+            path = self._path_for(session.upload_id)
+            path.unlink(missing_ok=True)
+            path.with_suffix(".json.tmp").unlink(missing_ok=True)
+            raise
         return session
 
     def save(self, session: UploadSession) -> None:

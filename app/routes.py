@@ -1,5 +1,7 @@
+
 from __future__ import annotations
 
+import logging
 import csv
 import hashlib
 import json
@@ -11,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from fastapi import APIRouter, Body, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.concurrency import run_in_threadpool
@@ -21,31 +23,74 @@ from pydantic import BaseModel
 
 from app.config import get_settings
 from app.file_browser import FileBrowserQuery, classify_file_type, filter_and_paginate
-from app.oci_client import OCIStorageError, OCIStorageService, classify_upload_exception
+from app.oci_client import OCIStorageError, OCIStorageService, classify_upload_exception, public_storage_error
 from app.settings_store import get_app_settings_store
 from app.share_store import ShareAccessError, get_share_store, public_share, share_status, summarize_shares, utc_now
 from app.storage_stats import summarize_objects
-from app.temp_uploads import TempUploadSessionStore, UploadedChunk
+from app.temp_uploads import TempUploadSessionStore, UploadQuotaExceeded, UploadedChunk
 from app.trash_store import RecycleBinService, get_trash_record_store
 from app.upload_dashboard import summarize_upload_tasks
 from app.upload_cleanup import run_upload_cleanup
 from app.upload_sessions import UploadSession, UploadedPart, UploadSessionStore
 from app.upload_tasks import get_upload_task_manager
-from app.utils import is_image_type, is_pdf_type, is_text_type, object_name_from_upload, to_data_url
+from app.security import FailureRateLimiter
 from app.webdav import basic_auth_matches, build_multistatus, href_for, map_path, parse_destination, relative_from_key
+from app.utils import is_image_type, is_pdf_type, is_text_type, object_name_from_upload, to_data_url
 
 router = APIRouter()
 templates = Jinja2Templates(directory="app/templates")
 
+@router.get("/healthz")
+def healthz() -> dict[str, str]:
+    return {"status": "ok"}
+
+logger = logging.getLogger(__name__)
+
+LOGIN_FAILURE_LIMITER = FailureRateLimiter()
+SHARE_FAILURE_LIMITER = FailureRateLimiter()
+WEBDAV_FAILURE_LIMITER = FailureRateLimiter()
+
+
+def _request_source(request: Request) -> str:
+    return request.client.host if request.client and request.client.host else "unknown"
+
+
+def _rate_limit_headers(retry_after: int) -> dict[str, str]:
+    return {"Retry-After": str(max(1, retry_after))}
+
+
+def _safe_error(exc: Exception, *, action: str, context: str) -> str:
+    logger.error(
+        "storage operation failed context=%s exception_type=%s category=%s status=%s",
+        context,
+        type(exc).__name__,
+        getattr(exc, "category", "unknown"),
+        getattr(exc, "status_code", 500),
+    )
+    return public_storage_error(exc, action=action)
+
+
+def _safe_upload_error(exc: OCIStorageError) -> str:
+    category = exc.category
+    if category == "timeout":
+        return "上传分片到对象存储超时，请稍后重试。"
+    if category == "http_429":
+        wait_hint = f"建议等待约 {exc.retry_after_seconds} 秒后再试。" if exc.retry_after_seconds else "请稍后重试。"
+        return f"上传分片请求过于频繁，{wait_hint}"
+    if category == "http_4xx":
+        return f"上传分片请求被对象存储拒绝（HTTP {exc.status_code}）。"
+    return _safe_error(exc, action="上传分片", context="upload_part")
+
 
 def build_upload_error_payload(*, part_num: int, exc: OCIStorageError) -> dict[str, object]:
+    safe_message = _safe_upload_error(exc)
     payload = {
         "ok": False,
         "part_num": part_num,
-        "detail": str(exc),
+        "detail": safe_message,
         "error_code": exc.category,
         "retryable": exc.retryable,
-        "reason": exc.reason,
+        "reason": safe_message,
     }
     if exc.retry_after_seconds is not None:
         payload["retry_after_seconds"] = exc.retry_after_seconds
@@ -158,6 +203,14 @@ def require_write_access(request: Request) -> None:
         raise HTTPException(status_code=403, detail="只读模式已开启，当前操作会写入对象存储，已阻止")
 
 
+
+def _safe_next_path(value: str | None) -> str:
+    candidate = (value or "/").strip()
+    parsed = urlsplit(candidate)
+    if parsed.scheme or parsed.netloc or not candidate.startswith("/") or candidate.startswith("//"):
+        return "/"
+    return candidate
+
 def redirect_to_login(next_path: str = "/") -> RedirectResponse:
     return RedirectResponse(url=f"/login?next={quote(next_path, safe='/?:=&')}", status_code=303)
 
@@ -248,7 +301,7 @@ async def try_reconcile_multipart_session_with_remote(store, storage, session: U
     except Exception as exc:
         warning = (
             "本次未完成 OCI 远端分片对账，已按本地上传会话状态继续恢复。"
-            f"为安全起见，最终合并前仍会再次校验。异常信息：{exc}"
+            f"为安全起见，最终合并前仍会再次校验。{_safe_error(exc, action='远端分片对账', context='multipart_reconcile')}"
         )
         return session, False, True, warning
 
@@ -331,7 +384,7 @@ def _normalize_object_names(object_names: list[str]) -> list[str]:
     normalized = []
     seen = set()
     for raw_name in object_names:
-        name = (raw_name or "").strip()
+        name = _normalize_path(raw_name)
         if not name or name in seen:
             continue
         seen.add(name)
@@ -339,8 +392,19 @@ def _normalize_object_names(object_names: list[str]) -> list[str]:
     return normalized
 
 
+def _safe_upload_object_name(filename: str) -> str:
+    try:
+        return object_name_from_upload(filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 def _normalize_prefix(prefix: str | None) -> str:
-    normalized = PurePosixPath("/" + (prefix or "").strip()).as_posix().lstrip("/")
+    raw = (prefix or "").strip()
+    if "\\" in raw:
+        raise HTTPException(status_code=400, detail="路径不允许反斜杠")
+    if any(part == ".." for part in raw.split("/")):
+        raise HTTPException(status_code=400, detail="路径不允许上级目录")
+    normalized = PurePosixPath("/" + raw).as_posix().lstrip("/")
     if normalized in {"", "."}:
         return ""
     return normalized.rstrip("/") + "/"
@@ -348,6 +412,10 @@ def _normalize_prefix(prefix: str | None) -> str:
 
 def _normalize_path(path: str | None) -> str:
     raw = (path or "").strip()
+    if "\\" in raw:
+        raise HTTPException(status_code=400, detail="路径不允许反斜杠")
+    if any(part == ".." for part in raw.split("/")):
+        raise HTTPException(status_code=400, detail="路径不允许上级目录")
     keep_trailing_slash = raw.endswith("/")
     normalized = PurePosixPath("/" + raw).as_posix().lstrip("/")
     if normalized in {"", "."}:
@@ -634,14 +702,15 @@ def _delete_prefix(storage: OCIStorageService, *, path_prefix: str, deleted_by: 
     for obj in objects:
         result = _delete_object_with_policy(storage, object_name=obj.name, deleted_by=deleted_by)
         deleted += 1
-        recycled += int(bool(result["recycled"]))
+        if result["recycled"]:
+            recycled += 1
     return {"deleted_count": deleted, "recycled_count": recycled}
-
-
 def _content_disposition_attachment(filename: str) -> str:
-    ascii_fallback = filename.encode("ascii", errors="ignore").decode("ascii") or "download.bin"
-    quoted = quote(filename)
-    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quoted}"
+    safe_name = "".join(character for character in (filename or "download.bin") if ord(character) >= 32 and character not in {"\"", "\\", ";"})
+    ascii_fallback = safe_name.encode("ascii", errors="ignore").decode("ascii") or "download.bin"
+    quoted = quote(safe_name or "download.bin")
+    return f'attachment; filename="{ascii_fallback}"; filename*=UTF-8\'\'{quoted}'
+
 
 
 def _share_is_authorized(request: Request, share_id: str) -> bool:
@@ -663,6 +732,7 @@ def _public_share_response(
     record: dict | None,
     error: str | None = None,
     status_code: int = 200,
+    headers: dict[str, str] | None = None,
 ):
     share = public_share(record) if record is not None else None
     password_required = bool(share and share["password_protected"] and not _share_is_authorized(request, share["id"]))
@@ -678,6 +748,7 @@ def _public_share_response(
             share_error=error,
         ),
         status_code=status_code,
+        headers=headers,
     )
 
 
@@ -685,20 +756,36 @@ def _webdav_authenticate(request: Request) -> None:
     enabled, configured_username, password_hash = get_app_settings_store().webdav_credentials()
     if not enabled:
         raise HTTPException(status_code=404, detail="WebDAV 未启用")
-    header = request.headers.get("authorization", "")
-    if not header.lower().startswith("basic "):
+
+    key = f"webdav:{_request_source(request)}"
+    limited, retry_after = WEBDAV_FAILURE_LIMITER.check(key)
+    auth_headers = {"WWW-Authenticate": 'Basic realm="OCI Object Bucket Browser"'}
+    if limited:
         raise HTTPException(
-            status_code=401,
-            detail="需要 WebDAV Basic Auth",
-            headers={"WWW-Authenticate": 'Basic realm="OCI Object Bucket Browser"'},
+            status_code=429,
+            detail="WebDAV 认证失败次数过多，请稍后重试。",
+            headers={**auth_headers, **_rate_limit_headers(retry_after)},
         )
-    if basic_auth_matches(header, username=configured_username, password_hash=password_hash):
-        return
-    raise HTTPException(
-        status_code=401,
-        detail="WebDAV 用户名或密码错误",
-        headers={"WWW-Authenticate": 'Basic realm="OCI Object Bucket Browser"'},
+
+    header = request.headers.get("authorization", "")
+    valid = header.lower().startswith("basic ") and basic_auth_matches(
+        header,
+        username=configured_username,
+        password_hash=password_hash,
     )
+    if valid:
+        WEBDAV_FAILURE_LIMITER.reset(key)
+        return
+
+    WEBDAV_FAILURE_LIMITER.record_failure(key)
+    limited, retry_after = WEBDAV_FAILURE_LIMITER.check(key)
+    if limited:
+        raise HTTPException(
+            status_code=429,
+            detail="WebDAV 认证失败次数过多，请稍后重试。",
+            headers={**auth_headers, **_rate_limit_headers(retry_after)},
+        )
+    raise HTTPException(status_code=401, detail="WebDAV 用户名或密码错误", headers=auth_headers)
 
 
 def _webdav_require_write() -> None:
@@ -829,7 +916,7 @@ async def webdav_endpoint(request: Request, path: str = ""):
         try:
             stream, content_type, upstream_headers = storage.open_stream(key)
         except OCIStorageError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(status_code=404, detail=_safe_error(exc, action="WebDAV 下载", context="webdav_get")) from exc
         headers = {"Content-Disposition": _content_disposition_attachment(relative.rsplit("/", 1)[-1])}
         if upstream_headers.get("content-length"):
             headers["Content-Length"] = upstream_headers["content-length"]
@@ -846,7 +933,7 @@ async def webdav_endpoint(request: Request, path: str = ""):
         try:
             storage.upload_file(key, BytesIO(body), request.headers.get("content-type"))
         except OCIStorageError as exc:
-            raise HTTPException(status_code=500, detail=f"WebDAV PUT 失败：{exc}") from exc
+            raise HTTPException(status_code=500, detail=_safe_error(exc, action="WebDAV 上传", context="webdav_put")) from exc
         return Response(status_code=204 if existed else 201, headers={"Content-Length": "0"})
 
     if method == "DELETE":
@@ -869,7 +956,7 @@ async def webdav_endpoint(request: Request, path: str = ""):
         try:
             storage.upload_file(folder_object, BytesIO(b""), "application/x-directory")
         except OCIStorageError as exc:
-            raise HTTPException(status_code=500, detail=f"WebDAV MKCOL 失败：{exc}") from exc
+            raise HTTPException(status_code=500, detail=_safe_error(exc, action="WebDAV 建目录", context="webdav_mkcol")) from exc
         return Response(status_code=201, headers={"Content-Length": "0"})
 
     if method == "MOVE":
@@ -957,30 +1044,55 @@ def _parse_single_range_header(range_header: str | None, *, total_size: int) -> 
 
 @router.get("/login", response_class=HTMLResponse)
 def login_page(request: Request, next: str = "/"):
+    next_path = _safe_next_path(next)
     if request.session.get("authenticated"):
-        return RedirectResponse(url=next or "/", status_code=303)
+        return RedirectResponse(url=next_path, status_code=303)
     return templates.TemplateResponse(
         request,
         "login.html",
-        template_context(request, error=None, next_path=next or "/"),
+        template_context(request, error=None, next_path=next_path),
     )
 
 
 @router.post("/login", response_class=HTMLResponse)
 def login_submit(request: Request, username: str = Form(...), password: str = Form(...), next_path: str = Form("/")):
+    next_path = _safe_next_path(next_path)
     settings = get_settings()
-    valid_user = secrets.compare_digest(username, settings.auth_username)
-    valid_pass = secrets.compare_digest(password, settings.auth_password)
-    if not (valid_user and valid_pass):
+    key = f"login:{_request_source(request)}"
+    limited, retry_after = LOGIN_FAILURE_LIMITER.check(key)
+    if limited:
         return templates.TemplateResponse(
             request,
             "login.html",
-            template_context(request, error="用户名或密码错误", next_path=next_path or "/"),
+            template_context(request, error="登录尝试过于频繁，请稍后重试。", next_path=next_path),
+            status_code=429,
+            headers=_rate_limit_headers(retry_after),
+        )
+
+    valid_user = secrets.compare_digest(username, settings.auth_username)
+    valid_pass = secrets.compare_digest(password, settings.auth_password)
+    if not (valid_user and valid_pass):
+        LOGIN_FAILURE_LIMITER.record_failure(key)
+        limited, retry_after = LOGIN_FAILURE_LIMITER.check(key)
+        if limited:
+            return templates.TemplateResponse(
+                request,
+                "login.html",
+                template_context(request, error="登录尝试过于频繁，请稍后重试。", next_path=next_path),
+                status_code=429,
+                headers=_rate_limit_headers(retry_after),
+            )
+        return templates.TemplateResponse(
+            request,
+            "login.html",
+            template_context(request, error="用户名或密码错误", next_path=next_path),
             status_code=401,
         )
+    LOGIN_FAILURE_LIMITER.reset(key)
+    request.session.clear()
     request.session["authenticated"] = True
     request.session["username"] = settings.auth_username
-    return RedirectResponse(url=next_path or "/", status_code=303)
+    return RedirectResponse(url=next_path, status_code=303)
 
 
 @router.post("/logout")
@@ -1052,7 +1164,7 @@ def index(
                 breadcrumbs=breadcrumbs,
                 parent_prefix=_parent_prefix(normalized_prefix),
                 upload_proxy_chunk_size_mb=get_settings().upload_proxy_chunk_size_mb,
-                error=str(exc),
+                error=_safe_error(exc, action="对象列表读取", context="index_list"),
             ),
             status_code=500,
         )
@@ -1124,7 +1236,7 @@ def create_share_api(request: Request, payload: CreateShareRequest = Body(...)):
     try:
         get_storage().head_object(object_key)
     except OCIStorageError as exc:
-        raise HTTPException(status_code=404, detail=f"无法创建分享：{exc}") from exc
+        raise HTTPException(status_code=404, detail=_safe_error(exc, action="创建分享", context="share_create")) from exc
 
     now = utc_now()
     record, token = get_share_store().create(
@@ -1149,7 +1261,7 @@ def revoke_share_api(request: Request, share_id: str):
     try:
         record = get_share_store().revoke(share_id)
     except ShareAccessError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise HTTPException(status_code=exc.status_code, detail="分享链接状态不可用") from exc
     return {
         "ok": True,
         "message": "分享链接已撤销",
@@ -1201,7 +1313,7 @@ def stats_page(request: Request, prefix: str = ""):
     except OCIStorageError as exc:
         summary = summarize_objects([], prefix=_normalize_prefix(prefix))
         summary["refreshed_at"] = None
-        error = str(exc)
+        error = _safe_error(exc, action="存储统计", context="stats_page")
     return templates.TemplateResponse(
         request,
         "stats.html",
@@ -1216,7 +1328,7 @@ def storage_stats_api(request: Request, prefix: str = ""):
     try:
         summary = _build_storage_stats(prefix)
     except OCIStorageError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_safe_error(exc, action="存储统计", context="stats_summary")) from exc
     return {"ok": True, "summary": summary}
 
 
@@ -1226,7 +1338,7 @@ def refresh_storage_stats_api(request: Request, prefix: str = ""):
     try:
         summary = _build_storage_stats(prefix)
     except OCIStorageError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_safe_error(exc, action="存储统计", context="stats_refresh")) from exc
     return {"ok": True, "message": "存储统计已刷新", "summary": summary}
 
 
@@ -1274,7 +1386,7 @@ def public_share_page(request: Request, token: str):
             request,
             token=token,
             record=record,
-            error=str(exc),
+            error=_safe_error(exc, action="访问分享", context="share_page_access"),
             status_code=exc.status_code,
         )
     return _public_share_response(request, token=token, record=record)
@@ -1291,10 +1403,33 @@ def verify_public_share_password(request: Request, token: str, password: str = F
             request,
             token=token,
             record=record,
-            error=str(exc),
+            error="分享密码验证失败，请稍后重试。",
             status_code=exc.status_code,
         )
+
+    rate_key = f"share:{_request_source(request)}:{hashlib.sha256(token.encode('utf-8')).hexdigest()}"
+    limited, retry_after = SHARE_FAILURE_LIMITER.check(rate_key)
+    if limited:
+        return _public_share_response(
+            request,
+            token=token,
+            record=record,
+            error="分享密码尝试过于频繁，请稍后重试。",
+            status_code=429,
+            headers=_rate_limit_headers(retry_after),
+        )
     if not store.password_matches(record, password):
+        SHARE_FAILURE_LIMITER.record_failure(rate_key)
+        limited, retry_after = SHARE_FAILURE_LIMITER.check(rate_key)
+        if limited:
+            return _public_share_response(
+                request,
+                token=token,
+                record=record,
+                error="分享密码尝试过于频繁，请稍后重试。",
+                status_code=429,
+                headers=_rate_limit_headers(retry_after),
+            )
         return _public_share_response(
             request,
             token=token,
@@ -1302,6 +1437,7 @@ def verify_public_share_password(request: Request, token: str, password: str = F
             error="分享密码错误",
             status_code=401,
         )
+    SHARE_FAILURE_LIMITER.reset(rate_key)
     _remember_share_authorization(request, record["id"])
     return RedirectResponse(url=f"/s/{quote(token, safe='')}", status_code=303)
 
@@ -1312,19 +1448,19 @@ def download_public_share(request: Request, token: str):
     try:
         record = store.require_active(token)
     except ShareAccessError as exc:
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise HTTPException(status_code=exc.status_code, detail="分享链接状态不可用") from exc
     if record.get("password_hash") and not _share_is_authorized(request, record["id"]):
         return RedirectResponse(url=f"/s/{quote(token, safe='')}", status_code=303)
 
     try:
         stream, content_type, upstream_headers = get_storage().open_stream(record["object_key"])
     except OCIStorageError as exc:
-        raise HTTPException(status_code=404, detail=f"分享对象读取失败：{exc}") from exc
+        raise HTTPException(status_code=404, detail=_safe_error(exc, action="读取分享对象", context="share_download")) from exc
     try:
         store.reserve_download(record["id"])
     except ShareAccessError as exc:
         stream.close()
-        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+        raise HTTPException(status_code=exc.status_code, detail="分享下载状态不可用") from exc
     except Exception:
         stream.close()
         raise
@@ -1383,7 +1519,16 @@ async def upload(request: Request, file: UploadFile = File(...), overwrite: bool
     require_write_access(request)
     if not file.filename:
         raise HTTPException(status_code=400, detail="缺少文件名")
-    object_name = object_name_from_upload(file.filename)
+    settings = get_settings()
+    try:
+        file.file.seek(0, 2)
+        upload_size = file.file.tell()
+        file.file.seek(0)
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail="无法读取上传文件大小") from exc
+    if upload_size > settings.upload_max_file_size_mb * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"文件超过服务器允许的大小上限（{settings.upload_max_file_size_mb} MB）")
+    object_name = _safe_upload_object_name(file.filename)
     storage = get_storage()
     conflict = _ensure_no_upload_conflict(storage, object_name=object_name, overwrite=overwrite)
     if conflict is not None:
@@ -1392,9 +1537,9 @@ async def upload(request: Request, file: UploadFile = File(...), overwrite: bool
     try:
         await run_in_threadpool(storage.upload_file, object_name, file.file, file.content_type)
     except OCIStorageError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_safe_error(exc, action="上传文件", context="single_upload")) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"上传过程中发生异常: {exc}") from exc
+        raise HTTPException(status_code=500, detail=_safe_error(exc, action="上传文件", context="single_upload_unexpected")) from exc
     finally:
         await file.close()
     if is_ajax:
@@ -1418,8 +1563,11 @@ async def init_server_upload(request: Request, payload: ServerProxyUploadInitReq
         raise HTTPException(status_code=400, detail="缺少文件名")
     if payload.file_size <= 0:
         raise HTTPException(status_code=400, detail="文件大小必须大于 0")
+    max_file_size = settings.upload_max_file_size_mb * 1024 * 1024
+    if payload.file_size > max_file_size:
+        raise HTTPException(status_code=413, detail=f"文件超过服务器允许的大小上限（{settings.upload_max_file_size_mb} MB）")
 
-    object_name = object_name_from_upload(payload.filename)
+    object_name = _safe_upload_object_name(payload.filename)
     storage = get_storage()
     conflict = _ensure_no_upload_conflict(storage, object_name=object_name, overwrite=payload.overwrite)
     if conflict is not None:
@@ -1449,20 +1597,36 @@ async def init_server_upload(request: Request, payload: ServerProxyUploadInitReq
 
     temp_upload_id = secrets.token_hex(8)
     temp_dir = Path(settings.upload_temp_dir).resolve()
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=507, detail="服务器暂存空间不足，请清理临时文件或稍后重试") from exc
     temp_path = temp_dir / f"{temp_upload_id}-{Path(payload.filename).name or 'upload.bin'}"
-    temp_path.write_bytes(b"")
-    session = temp_store.create(
-        temp_upload_id=temp_upload_id,
-        filename=payload.filename,
-        object_name=object_name,
-        content_type=payload.content_type or "application/octet-stream",
-        total_size=payload.file_size,
-        chunk_size=chunk_size,
-        strategy=strategy,
-        file_fingerprint=file_fingerprint,
-        staged_path=str(temp_path),
-    )
+    try:
+        session = temp_store.create(
+            temp_upload_id=temp_upload_id,
+            filename=payload.filename,
+            object_name=object_name,
+            content_type=payload.content_type or "application/octet-stream",
+            total_size=payload.file_size,
+            chunk_size=chunk_size,
+            strategy=strategy,
+            file_fingerprint=file_fingerprint,
+            staged_path=str(temp_path),
+            max_staging_bytes=settings.upload_max_staging_mb * 1024 * 1024,
+            max_active_sessions=settings.upload_max_active_tasks,
+        )
+    except UploadQuotaExceeded as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except OSError as exc:
+        temp_store.delete(temp_upload_id)
+        raise HTTPException(status_code=507, detail="服务器暂存空间不足，请清理临时文件或稍后重试") from exc
+    try:
+        temp_path.write_bytes(b"")
+    except OSError as exc:
+        temp_store.delete(temp_upload_id)
+        temp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=507, detail="服务器暂存空间不足，请清理临时文件或稍后重试") from exc
 
     return {
         "ok": True,
@@ -1514,67 +1678,40 @@ async def stage_server_upload_chunk(
     temp_upload_id: str,
     chunk_index: int = Query(..., ge=0),
     chunk_sha256: str | None = Query(default=None),
-    body: bytes = Body(...),
 ):
     require_write_access(request)
+    settings = get_settings()
+    max_chunk_size = settings.upload_max_chunk_size_mb * 1024 * 1024
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > max_chunk_size:
+        raise HTTPException(status_code=413, detail=f"单个 chunk 超过服务器允许的大小上限（{settings.upload_max_chunk_size_mb} MB）")
+
+    body_buffer = bytearray()
+    async for part in request.stream():
+        if len(body_buffer) + len(part) > max_chunk_size:
+            raise HTTPException(status_code=413, detail=f"单个 chunk 超过服务器允许的大小上限（{settings.upload_max_chunk_size_mb} MB）")
+        body_buffer.extend(part)
+    body = bytes(body_buffer)
+
     temp_store = get_temp_upload_store()
-    session = temp_store.get(temp_upload_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="临时上传不存在")
-    if session.committed:
-        raise HTTPException(status_code=409, detail="临时上传已提交，不能继续写入")
-
-    chunk_size = session.chunk_size
-    total_chunks = session.total_chunks
-    if chunk_index >= total_chunks:
-        raise HTTPException(status_code=400, detail="chunk_index 超出范围")
-
-    expected_size = chunk_size if chunk_index < total_chunks - 1 else session.total_size - chunk_size * (total_chunks - 1)
-    if len(body) != expected_size:
-        raise HTTPException(status_code=400, detail=f"chunk 大小不匹配，期望 {expected_size}，实际 {len(body)}")
-
-    body_sha256 = hashlib.sha256(body).hexdigest()
-    if chunk_sha256 and chunk_sha256.lower() != body_sha256:
-        raise HTTPException(status_code=400, detail="chunk 校验失败：sha256 不匹配")
-
-    existing = session.uploaded_chunks.get(chunk_index)
-    if existing:
-        if existing.size == len(body) and existing.sha256 == body_sha256:
-            staged_path = Path(session.staged_path)
-            return {
-                "ok": True,
-                "chunk_index": chunk_index,
-                "stored_bytes": len(body),
-                "staged_size": staged_path.stat().st_size if staged_path.exists() else session.uploaded_bytes,
-                "already_uploaded": True,
-                "uploaded_chunks": session.uploaded_chunk_indexes,
-                "missing_chunks": session.missing_chunk_indexes,
-            }
-        raise HTTPException(status_code=409, detail="该 chunk 已存在且内容不一致，请确认是否选择了同一文件")
-
-    staged_path = Path(session.staged_path)
-    staged_path.parent.mkdir(parents=True, exist_ok=True)
-    if not staged_path.exists():
-        staged_path.write_bytes(b"")
-    offset = chunk_index * chunk_size
-    with open(staged_path, "r+b") as fileobj:
-        fileobj.seek(offset)
-        fileobj.write(body)
-
-    updated = temp_store.update(
-        temp_upload_id,
-        lambda s: s.uploaded_chunks.__setitem__(
-            chunk_index,
-            UploadedChunk(chunk_index=chunk_index, size=len(body), sha256=body_sha256),
-        ),
-    )
-    current_size = staged_path.stat().st_size
+    try:
+        updated, already_uploaded, current_size = temp_store.stage_chunk(
+            temp_upload_id, chunk_index, body, chunk_sha256
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="临时上传不存在") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=507, detail="服务器暂存空间不足，请清理临时文件或稍后重试") from exc
+    except ValueError as exc:
+        detail = str(exc)
+        code = 409 if "已存在" in detail or "已提交" in detail else 400
+        raise HTTPException(status_code=code, detail=detail) from exc
     return {
         "ok": True,
         "chunk_index": chunk_index,
         "stored_bytes": len(body),
         "staged_size": current_size,
-        "already_uploaded": False,
+        "already_uploaded": already_uploaded,
         "uploaded_chunks": updated.uploaded_chunk_indexes,
         "missing_chunks": updated.missing_chunk_indexes,
     }
@@ -1599,6 +1736,12 @@ async def commit_server_upload(request: Request, payload: ServerProxyCommitReque
     actual_size = staged_path.stat().st_size
     if actual_size != payload.file_size:
         raise HTTPException(status_code=400, detail=f"暂存文件大小不匹配，期望 {payload.file_size}，实际 {actual_size}")
+    settings = get_settings()
+    manager = get_upload_task_manager()
+    list_all_tasks = getattr(manager.task_store, "list_all", lambda: [])
+    active_task_count = sum(1 for task in list_all_tasks() if getattr(task, "status", "") in {"queued", "running", "finalizing"})
+    if active_task_count >= settings.upload_max_active_tasks:
+        raise HTTPException(status_code=429, detail="后台上传任务数量已达到上限，请等待已有任务完成后再试")
     storage = get_storage()
     conflict = _ensure_no_upload_conflict(storage, object_name=session.object_name, overwrite=payload.overwrite)
     if conflict is not None:
@@ -1614,7 +1757,6 @@ async def commit_server_upload(request: Request, payload: ServerProxyCommitReque
         )
     except HTTPException:
         raise
-    manager = get_upload_task_manager()
     try:
         task = await run_in_threadpool(
             manager.create_task_from_staged_file,
@@ -1623,6 +1765,9 @@ async def commit_server_upload(request: Request, payload: ServerProxyCommitReque
             staged_path=str(staged_path),
             total_size=payload.file_size,
         )
+    except UploadQuotaExceeded as exc:
+        temp_store.update(temp_upload_id, lambda current: setattr(current, "committed", False))
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
     except Exception:
         temp_store.update(temp_upload_id, lambda current: setattr(current, "committed", False))
         raise
@@ -1687,7 +1832,7 @@ async def retry_server_upload_task(request: Request, task_id: str):
     try:
         task = get_upload_task_manager().retry(task_id)
     except (ValueError, FileNotFoundError, RuntimeError) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=409, detail="上传任务当前无法重试，请检查任务状态后再试。") from exc
     if not task:
         raise HTTPException(status_code=404, detail="上传任务不存在")
     return {"ok": True, "task_id": task_id, "status": task.status, "message": "失败任务已重新排队"}
@@ -1724,8 +1869,10 @@ async def init_upload(request: Request, payload: UploadInitRequest = Body(...)):
         raise HTTPException(status_code=400, detail="缺少文件名")
     if payload.file_size <= 0:
         raise HTTPException(status_code=400, detail="文件大小必须大于 0")
+    if payload.file_size > settings.upload_max_file_size_mb * 1024 * 1024:
+        raise HTTPException(status_code=413, detail=f"文件超过服务器允许的大小上限（{settings.upload_max_file_size_mb} MB）")
 
-    object_name = object_name_from_upload(payload.filename)
+    object_name = _safe_upload_object_name(payload.filename)
     content_type = payload.content_type or "application/octet-stream"
     chunk_size = settings.upload_chunk_size_mb * 1024 * 1024
     threshold = settings.upload_single_put_threshold_mb * 1024 * 1024
@@ -1799,8 +1946,19 @@ async def init_upload(request: Request, payload: UploadInitRequest = Body(...)):
 
 
 @router.put("/api/uploads/{upload_id}/part/{part_num}")
-async def upload_part(request: Request, response: Response, upload_id: str, part_num: int, body: bytes = Body(...)):
+async def upload_part(request: Request, response: Response, upload_id: str, part_num: int):
     require_write_access(request)
+    settings = get_settings()
+    max_chunk_size = settings.upload_max_chunk_size_mb * 1024 * 1024
+    content_length = request.headers.get("content-length")
+    if content_length and content_length.isdigit() and int(content_length) > max_chunk_size:
+        raise HTTPException(status_code=413, detail=f"单个 chunk 超过服务器允许的大小上限（{settings.upload_max_chunk_size_mb} MB）")
+    body_buffer = bytearray()
+    async for part in request.stream():
+        if len(body_buffer) + len(part) > max_chunk_size:
+            raise HTTPException(status_code=413, detail=f"单个 chunk 超过服务器允许的大小上限（{settings.upload_max_chunk_size_mb} MB）")
+        body_buffer.extend(part)
+    body = bytes(body_buffer)
     if part_num <= 0:
         raise HTTPException(status_code=400, detail="part_num 必须从 1 开始")
 
@@ -1969,7 +2127,7 @@ def download(request: Request, object_name: str):
     try:
         object_info = storage.head_object(object_name)
     except OCIStorageError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=_safe_error(exc, action="读取对象", context="download_head")) from exc
 
     total_size = object_info.size or 0
     requested_range = _parse_single_range_header(request.headers.get("range"), total_size=total_size) if object_info.size is not None else None
@@ -1994,14 +2152,13 @@ def download(request: Request, object_name: str):
     try:
         stream, content_type, upstream_headers = storage.open_stream(object_name, range_header=range_header)
     except OCIStorageError as exc:
-        detail = str(exc)
-        if requested_range is not None and ("Range Not Satisfiable" in detail or "range" in detail.lower()):
+        if requested_range is not None and getattr(exc, "status_code", 500) == status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE:
             raise HTTPException(
                 status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
-                detail=detail,
-                headers={"Content-Range": f"bytes */{total_size}"},
+                detail="当前 Range 请求无法满足对象大小限制",
+                headers={"Content-Range": f"bytes */{object_info.size or 0}"},
             ) from exc
-        raise HTTPException(status_code=404, detail=detail) from exc
+        raise HTTPException(status_code=500, detail=_safe_error(exc, action="下载对象", context="download_stream")) from exc
 
     if status_code == status.HTTP_200_OK:
         upstream_length = upstream_headers.get("content-length")
@@ -2026,11 +2183,11 @@ async def batch_download_objects(request: Request, prefix: str = Query(default="
         try:
             raw_payload = await request.json()
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"批量下载请求体无效：{exc}") from exc
+            raise HTTPException(status_code=400, detail="批量下载请求体无效，请检查对象列表格式。") from exc
         try:
             payload = BatchDownloadRequest.model_validate(raw_payload)
         except Exception as exc:
-            raise HTTPException(status_code=400, detail=f"批量下载请求体无效：{exc}") from exc
+            raise HTTPException(status_code=400, detail="批量下载请求体无效，请检查对象列表格式。") from exc
         raw_object_names = payload.object_names
     else:
         form = await request.form()
@@ -2058,10 +2215,10 @@ async def batch_download_objects(request: Request, prefix: str = Query(default="
                 try:
                     stream, _content_type, _headers = storage.open_stream(object_name)
                 except OCIStorageError as exc:
-                    failed.append({"object_name": object_name, "detail": str(exc)})
+                    failed.append({"object_name": object_name, "detail": _safe_error(exc, action="读取对象", context="batch_download")})
                     continue
                 except Exception as exc:
-                    failed.append({"object_name": object_name, "detail": f"异常信息：{exc}"})
+                    failed.append({"object_name": object_name, "detail": _safe_error(exc, action="读取对象", context="batch_download_unexpected")})
                     continue
 
                 with stream:
@@ -2101,7 +2258,7 @@ async def batch_download_objects(request: Request, prefix: str = Query(default="
         raise
     except Exception as exc:
         temp_file.close()
-        raise HTTPException(status_code=500, detail=f"批量下载打包失败：{exc}") from exc
+        raise HTTPException(status_code=500, detail="批量下载打包失败，请稍后重试。") from exc
 
 
 @router.get("/api/files")
@@ -2133,7 +2290,7 @@ def list_files_api(
             ),
         )
     except OCIStorageError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=_safe_error(exc, action="读取对象列表", context="files_api")) from exc
 
     return {
         "ok": True,
@@ -2201,7 +2358,7 @@ def create_folder(request: Request, payload: CreateFolderRequest = Body(...)):
     try:
         storage.upload_file(folder_object_name, BytesIO(b""), "application/x-directory")
     except OCIStorageError as exc:
-        raise HTTPException(status_code=500, detail=f"创建目录失败：{exc}") from exc
+        raise HTTPException(status_code=500, detail=_safe_error(exc, action="创建目录", context="folder_create")) from exc
 
     return {
         "ok": True,
@@ -2270,7 +2427,7 @@ def rename_path(request: Request, payload: RenamePathRequest = Body(...)):
     except HTTPException:
         raise
     except OCIStorageError as exc:
-        raise HTTPException(status_code=500, detail=f"重命名失败：{exc}") from exc
+        raise HTTPException(status_code=500, detail=_safe_error(exc, action="重命名对象", context="rename")) from exc
 
 
 @router.post("/api/files/delete")
@@ -2316,9 +2473,9 @@ def delete_path(request: Request, payload: DeletePathRequest = Body(...)):
     except HTTPException:
         raise
     except OCIStorageError as exc:
-        raise HTTPException(status_code=500, detail=f"删除失败：{exc}") from exc
+        raise HTTPException(status_code=500, detail=_safe_error(exc, action="删除对象", context="delete_path")) from exc
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"删除失败：{exc}") from exc
+        raise HTTPException(status_code=500, detail=_safe_error(exc, action="删除对象", context="delete_path_unexpected")) from exc
 
 
 @router.post("/objects/batch-delete")
@@ -2356,9 +2513,9 @@ def batch_delete_objects(request: Request, payload: BatchDeleteRequest = Body(..
                     }
                 )
         except OCIStorageError as exc:
-            failed.append({"object_name": object_name, "detail": str(exc)})
+            failed.append({"object_name": object_name, "detail": _safe_error(exc, action="删除对象", context="batch_delete")})
         except Exception as exc:
-            failed.append({"object_name": object_name, "detail": f"异常信息：{exc}"})
+            failed.append({"object_name": object_name, "detail": _safe_error(exc, action="删除对象", context="batch_delete_unexpected")})
 
     deleted_count = len(deleted)
     failed_count = len(failed)
@@ -2418,7 +2575,7 @@ def delete_object(request: Request, object_name: str):
             deleted_by="web-ui",
         )
     except OCIStorageError as exc:
-        detail = str(exc)
+        detail = _safe_error(exc, action="删除对象", context="delete_object")
         raise HTTPException(
             status_code=404,
             detail=f"删除对象失败：{object_name}。{detail}",
@@ -2426,7 +2583,7 @@ def delete_object(request: Request, object_name: str):
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"删除对象失败：{object_name}。异常信息：{exc}",
+            detail=f"删除对象失败：{object_name}。{_safe_error(exc, action='删除对象', context='delete_object_unexpected')}",
         ) from exc
 
     return {
@@ -2454,7 +2611,7 @@ def thumb(request: Request, object_name: str):
     try:
         preview = get_storage().get_preview(object_name)
     except OCIStorageError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=_safe_error(exc, action="读取缩略图", context="thumbnail")) from exc
 
     if preview.kind != "image" or not preview.bytes_data:
         raise HTTPException(status_code=404, detail="该对象不支持缩略图")
@@ -2469,7 +2626,7 @@ def view_object(request: Request, object_name: str):
     try:
         preview = get_storage().get_preview(object_name)
     except OCIStorageError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=_safe_error(exc, action="预览对象", context="preview")) from exc
 
     context = template_context(
         request,

@@ -138,3 +138,17 @@ def test_webdav_delete_uses_shared_recycle_bin_policy(tmp_path):
     assert trash_upload[0].endswith('/root.txt')
     assert trash_upload[1] == b'root'
     assert fake_storage.deleted_objects == ['root.txt']
+
+def test_webdav_auth_failures_are_rate_limited(tmp_path):
+    client, _fake_storage, _manager = webdav_client(tmp_path)
+    responses = [
+        client.get('/webdav', headers=dav_auth(password='wrong-password'))
+        for _ in range(6)
+    ]
+
+    assert [response.status_code for response in responses[:4]] == [401] * 4
+    assert responses[4].status_code == 429
+    assert responses[5].status_code == 429
+    assert int(responses[4].headers['retry-after']) > 0
+    from app.routes import WEBDAV_FAILURE_LIMITER
+    WEBDAV_FAILURE_LIMITER.reset('webdav:testclient')

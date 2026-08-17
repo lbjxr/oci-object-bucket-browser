@@ -363,3 +363,33 @@ def test_manual_cleanup_route_returns_deleted_entries(tmp_path):
     assert str(staged_path.resolve()) in payload['deleted_temp_files']
     assert not staged_path.exists()
     assert not session_path.exists()
+
+def test_staging_chunks_commit_file_and_metadata_atomically(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    store = TempUploadSessionStore(str(tmp_path / 'staging'))
+    staged_path = tmp_path / 'staging' / 'upload.bin'
+    session = store.create(
+        temp_upload_id='atomic-upload',
+        filename='upload.bin',
+        object_name='upload.bin',
+        content_type='application/octet-stream',
+        total_size=16,
+        chunk_size=8,
+        strategy='single-put-server-proxy',
+        file_fingerprint='atomic-fingerprint',
+        staged_path=str(staged_path),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(store.stage_chunk, session.temp_upload_id, 0, b'a' * 8),
+            executor.submit(store.stage_chunk, session.temp_upload_id, 1, b'b' * 8),
+        ]
+        results = [future.result() for future in futures]
+
+    stored = store.get(session.temp_upload_id)
+    assert stored is not None
+    assert set(stored.uploaded_chunk_indexes) == {0, 1}
+    assert staged_path.read_bytes() == b'a' * 8 + b'b' * 8
+    assert all(not already_uploaded for _updated, already_uploaded, _size in results)

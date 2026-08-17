@@ -1,4 +1,5 @@
 import json
+import hashlib
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -156,3 +157,20 @@ def test_share_api_requires_admin_login_but_public_route_does_not(tmp_path):
 
     assert client.get('/api/shares').status_code == 401
     assert client.get(f'/s/{token}').status_code == 200
+
+def test_share_password_failures_are_rate_limited(tmp_path):
+    client, _fake_storage, _manager = share_client(tmp_path)
+    _payload, token = create_share(client, password='secure-share')
+
+    responses = [
+        client.post(f'/s/{token}/verify-password', data={'password': 'wrong-password'})
+        for _ in range(6)
+    ]
+    assert [response.status_code for response in responses[:4]] == [401] * 4
+    assert responses[4].status_code == 429
+    assert responses[5].status_code == 429
+    assert int(responses[4].headers['retry-after']) > 0
+    assert int(responses[5].headers['retry-after']) > 0
+    from app.routes import SHARE_FAILURE_LIMITER
+    key = f"share:testclient:{hashlib.sha256(token.encode('utf-8')).hexdigest()}"
+    SHARE_FAILURE_LIMITER.reset(key)

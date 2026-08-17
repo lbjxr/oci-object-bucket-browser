@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 import threading
@@ -12,7 +13,8 @@ from pathlib import Path
 from typing import Callable
 
 from app.config import Settings, get_settings
-from app.oci_client import OCIStorageError, OCIStorageService, classify_upload_exception
+from app.oci_client import OCIStorageError, OCIStorageService, classify_upload_exception, public_storage_error
+from app.temp_uploads import UploadQuotaExceeded
 from app.upload_sessions import UploadedPart, UploadSessionStore
 from app.utils import object_name_from_upload
 
@@ -27,6 +29,13 @@ class UploadTaskCanceledError(RuntimeError):
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+def _public_task_error(error: str | None) -> str | None:
+    if not error:
+        return None
+    if "暂存文件不存在" in error:
+        return "服务重启后恢复失败：暂存文件已丢失。"
+    return public_storage_error(RuntimeError(error), action="后台上传")
 
 
 @dataclass
@@ -55,6 +64,7 @@ class ServerUploadTask:
 
     def to_api_dict(self) -> dict:
         payload = self.to_dict()
+        payload["error"] = _public_task_error(self.error)
         payload.update(describe_task_state(self))
         return payload
 
@@ -159,7 +169,7 @@ def _parse_retry_state(task: ServerUploadTask) -> dict:
     elif retrying and retry_kind == "part":
         retry_label = f"后台重试中（分片 {retry_part_num}，第 {retry_attempt} 次）" if retry_part_num is not None else f"后台重试中（第 {retry_attempt} 次）"
 
-    last_error = task.error or None
+    last_error = _public_task_error(task.error)
     return {
         "is_retrying": retrying,
         "retry_count": retry_count,
@@ -245,28 +255,47 @@ class ServerUploadTaskStore:
         total_parts: int | None,
         upload_session_id: str | None,
         multipart_upload_id: str | None,
+        max_active_tasks: int | None = None,
     ) -> ServerUploadTask:
-        now = utc_now_iso()
-        task = ServerUploadTask(
-            task_id=uuid.uuid4().hex,
-            object_name=object_name,
-            filename=filename,
-            content_type=content_type,
-            total_size=total_size,
-            strategy=strategy,
-            status="queued",
-            phase="waiting",
-            created_at=now,
-            updated_at=now,
-            temp_path=temp_path,
-            upload_session_id=upload_session_id,
-            multipart_upload_id=multipart_upload_id,
-            uploaded_parts=[],
-            total_parts=total_parts,
-            parallelism=max(1, parallelism),
-        )
-        self.save(task)
-        return task
+        with self._lock:
+            if max_active_tasks is not None:
+                active_count = 0
+                for path in self.base_dir.glob("*.json"):
+                    try:
+                        task = self._read_path_unlocked(path)
+                    except Exception:
+                        continue
+                    if task is not None and task.status in ACTIVE_STATUSES:
+                        active_count += 1
+                if active_count >= max_active_tasks:
+                    raise UploadQuotaExceeded("后台上传任务数量已达到上限，请等待已有任务完成后再试")
+            now = utc_now_iso()
+            task = ServerUploadTask(
+                task_id=uuid.uuid4().hex,
+                object_name=object_name,
+                filename=filename,
+                content_type=content_type,
+                total_size=total_size,
+                strategy=strategy,
+                status="queued",
+                phase="waiting",
+                created_at=now,
+                updated_at=now,
+                temp_path=temp_path,
+                upload_session_id=upload_session_id,
+                multipart_upload_id=multipart_upload_id,
+                uploaded_parts=[],
+                total_parts=total_parts,
+                parallelism=max(1, parallelism),
+            )
+            try:
+                self._write_unlocked(task)
+            except OSError:
+                path = self._path_for(task.task_id)
+                path.unlink(missing_ok=True)
+                path.with_suffix(".json.tmp").unlink(missing_ok=True)
+                raise
+            return task
 
     def save(self, task: ServerUploadTask) -> None:
         with self._lock:
@@ -319,6 +348,8 @@ class ServerUploadTaskManager:
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         self._threads: dict[str, threading.Thread] = {}
         self._threads_lock = threading.Lock()
+        self._task_create_lock = threading.Lock()
+        self._reserved_task_slots = 0
         self._max_retry_attempts = 3
         self._base_retry_delay_seconds = 1.0
         self._max_retry_delay_seconds = 8.0
@@ -330,7 +361,29 @@ class ServerUploadTaskManager:
         safe_name = Path(filename).name or "upload.bin"
         return self.temp_dir / f"{task_hint}-{safe_name}"
 
+    @contextmanager
+    def _reserve_task_slot(self):
+        with self._task_create_lock:
+            active_count = sum(task.status in ACTIVE_STATUSES for task in self.task_store.list_all())
+            if active_count + self._reserved_task_slots >= self.settings.upload_max_active_tasks:
+                raise UploadQuotaExceeded("后台上传任务数量已达到上限，请等待已有任务完成后再试")
+            self._reserved_task_slots += 1
+        try:
+            yield
+        finally:
+            with self._task_create_lock:
+                self._reserved_task_slots -= 1
+
     def create_task_from_staged_file(self, *, filename: str, content_type: str | None, staged_path: str, total_size: int) -> ServerUploadTask:
+        with self._reserve_task_slot():
+            return self._create_task_from_staged_file(
+                filename=filename,
+                content_type=content_type,
+                staged_path=staged_path,
+                total_size=total_size,
+            )
+
+    def _create_task_from_staged_file(self, *, filename: str, content_type: str | None, staged_path: str, total_size: int) -> ServerUploadTask:
         settings = self.settings
         object_name = object_name_from_upload(filename)
         content_type = content_type or "application/octet-stream"
@@ -341,36 +394,49 @@ class ServerUploadTaskManager:
         multipart_upload_id = None
         upload_session_id = None
         total_parts = None
-        if strategy != "single-put-server-proxy":
-            storage = OCIStorageService(settings)
-            multipart_upload_id = storage.create_multipart_upload(object_name, content_type)
-            session = self.session_store.create(
+        storage = None
+        session = None
+        try:
+            if strategy != "single-put-server-proxy":
+                storage = OCIStorageService(settings)
+                multipart_upload_id = storage.create_multipart_upload(object_name, content_type)
+                session = self.session_store.create(
+                    object_name=object_name,
+                    content_type=content_type,
+                    total_size=total_size,
+                    chunk_size=chunk_size,
+                    parallelism=settings.upload_parallelism,
+                    strategy="oci-multipart-server-proxy",
+                    fingerprint=f"server-task:{uuid.uuid4().hex}",
+                    multipart_upload_id=multipart_upload_id,
+                )
+                upload_session_id = session.upload_id
+                total_parts = (total_size + chunk_size - 1) // chunk_size
+
+            task = self.task_store.create(
                 object_name=object_name,
+                filename=filename,
                 content_type=content_type,
                 total_size=total_size,
-                chunk_size=chunk_size,
-                parallelism=settings.upload_parallelism,
-                strategy="oci-multipart-server-proxy",
-                fingerprint=f"server-task:{uuid.uuid4().hex}",
+                strategy=strategy,
+                temp_path=staged_path,
+                parallelism=settings.upload_parallelism if strategy != "single-put-server-proxy" else 1,
+                total_parts=total_parts,
+                upload_session_id=upload_session_id,
                 multipart_upload_id=multipart_upload_id,
+                max_active_tasks=settings.upload_max_active_tasks,
             )
-            upload_session_id = session.upload_id
-            total_parts = (total_size + chunk_size - 1) // chunk_size
-
-        task = self.task_store.create(
-            object_name=object_name,
-            filename=filename,
-            content_type=content_type,
-            total_size=total_size,
-            strategy=strategy,
-            temp_path=staged_path,
-            parallelism=settings.upload_parallelism if strategy != "single-put-server-proxy" else 1,
-            total_parts=total_parts,
-            upload_session_id=upload_session_id,
-            multipart_upload_id=multipart_upload_id,
-        )
-        self.start(task.task_id)
-        return task
+            self.start(task.task_id)
+            return task
+        except Exception:
+            if session is not None:
+                self.session_store.delete(session.upload_id)
+            if storage is not None and multipart_upload_id:
+                try:
+                    storage.abort_multipart_upload(object_name=object_name, multipart_upload_id=multipart_upload_id)
+                except Exception:
+                    pass
+            raise
 
     def start(self, task_id: str) -> bool:
         task = self.task_store.get(task_id)
@@ -476,7 +542,13 @@ class ServerUploadTaskManager:
                 pass
         except Exception as exc:
             try:
-                self.task_store.update(task_id, lambda t: (setattr(t, "status", "failed"), setattr(t, "phase", "error"), setattr(t, "error", str(exc))))
+                def mark_failed(current: ServerUploadTask) -> None:
+                    if current.status != "canceled":
+                        current.status = "failed"
+                        current.phase = "error"
+                        current.error = str(exc)
+
+                self.task_store.update(task_id, mark_failed)
             except Exception:
                 pass
         finally:

@@ -96,7 +96,7 @@ class UploadCleanupService:
         self.task_dir = self.task_store.base_dir
         self.temp_dir = Path(os.path.expanduser(self.settings.upload_temp_dir)).resolve()
         self.upload_session_dir = self.upload_session_store.base_dir
-        self._run_lock = threading.Lock()
+        self._run_lock = self.temp_store.lock
 
     def run_once(self) -> UploadCleanupResult:
         with self._run_lock:

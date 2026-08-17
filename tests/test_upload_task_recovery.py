@@ -3,9 +3,10 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-
+import pytest
 from app.config import Settings
 from app.upload_sessions import UploadedPart, UploadSessionStore
+from app.temp_uploads import UploadQuotaExceeded
 from app.upload_tasks import ServerUploadTaskManager, ServerUploadTaskStore, describe_task_state
 
 
@@ -574,7 +575,7 @@ def test_describe_task_state_for_retrying_single_put(tmp_path):
     assert payload['retry_kind'] == 'single_put'
     assert payload['retry_part_num'] is None
     assert payload['retry_label'] == '后台重试中（第 2 次，共 3 次）'
-    assert payload['last_error'] == 'single-put 上传失败，2.0 秒后重试：timeout'
+    assert payload['last_error'] == '后台上传服务暂时不可用，请稍后重试。'
 
 
 def test_describe_task_state_for_retrying_part(tmp_path):
@@ -611,4 +612,51 @@ def test_describe_task_state_for_retrying_part(tmp_path):
     assert payload['retry_kind'] == 'part'
     assert payload['retry_part_num'] == 3
     assert payload['retry_label'] == '后台重试中（分片 3，第 1 次）'
-    assert payload['last_error'] == '分片 3 上传失败，1.0 秒后重试：http_429'
+    assert payload['last_error'] == '后台上传服务暂时不可用，请稍后重试。'
+
+def test_task_store_enforces_active_quota_atomically(tmp_path):
+    store = ServerUploadTaskStore(str(tmp_path / 'tasks'))
+    kwargs = {
+        'object_name': 'one.bin',
+        'filename': 'one.bin',
+        'content_type': 'application/octet-stream',
+        'total_size': 1,
+        'strategy': 'single-put-server-proxy',
+        'temp_path': str(tmp_path / 'one.bin'),
+        'parallelism': 1,
+        'total_parts': None,
+        'upload_session_id': None,
+        'multipart_upload_id': None,
+        'max_active_tasks': 1,
+    }
+    store.create(**kwargs)
+
+    with pytest.raises(UploadQuotaExceeded):
+        store.create(**{**kwargs, 'object_name': 'two.bin', 'filename': 'two.bin'})
+
+
+def test_manager_rejects_task_before_external_upload_when_quota_full(tmp_path):
+    settings = build_settings(tmp_path)
+    active_store = ServerUploadTaskStore(settings.upload_task_dir)
+    active_store.create(
+        object_name='active.bin',
+        filename='active.bin',
+        content_type='application/octet-stream',
+        total_size=1,
+        strategy='single-put-server-proxy',
+        temp_path=str(tmp_path / 'active.bin'),
+        parallelism=1,
+        total_parts=None,
+        upload_session_id=None,
+        multipart_upload_id=None,
+    )
+    limited_settings = Settings(**{**settings.__dict__, 'upload_max_active_tasks': 1})
+    manager = ServerUploadTaskManager(settings=limited_settings, auto_recover=False)
+
+    with pytest.raises(UploadQuotaExceeded):
+        manager.create_task_from_staged_file(
+            filename='blocked.bin',
+            content_type='application/octet-stream',
+            staged_path=str(tmp_path / 'blocked.bin'),
+            total_size=1,
+        )

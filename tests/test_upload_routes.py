@@ -135,6 +135,9 @@ class DummyUploadTaskManager:
 
 def make_client(tmp_path: Path):
     import app.routes as routes
+    routes.LOGIN_FAILURE_LIMITER.clear()
+    routes.SHARE_FAILURE_LIMITER.clear()
+    routes.WEBDAV_FAILURE_LIMITER.clear()
     from app.config import get_settings
     from app.main import create_app
 
@@ -263,9 +266,22 @@ def make_client(tmp_path: Path):
     dummy_manager = DummyUploadTaskManager()
     routes.get_storage = lambda: fake_storage
     routes.get_upload_task_manager = lambda: dummy_manager
-    client = TestClient(create_app())
+    client = TestClient(create_app(), headers={'Origin': 'http://testserver'})
     client.post('/login', data={'username': 'test-admin', 'password': 'test-password-for-smoke', 'next_path': '/'})
     return client, fake_storage, dummy_manager
+
+def test_upload_error_payload_does_not_expose_provider_message(tmp_path):
+    from app.oci_client import OCIStorageError
+    from app.routes import build_upload_error_payload
+
+    secret = 'provider-request-secret-token'
+    payload = build_upload_error_payload(
+        part_num=1,
+        exc=OCIStorageError(secret, category='http_5xx', status_code=503, reason=secret),
+    )
+
+    assert secret not in str(payload)
+    assert payload['detail'] == '上传分片服务暂时不可用，请稍后重试。'
 
 
 def test_app_lifespan_starts_and_stops_cleanup_scheduler(tmp_path):
@@ -308,6 +324,18 @@ def test_small_file_upload_still_uses_single_put(tmp_path):
     assert payload['strategy'] == 'single-put'
     assert fake_storage.single_uploads[0][0] == 'tiny.txt'
 
+
+def test_direct_upload_respects_file_size_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv('APP_UPLOAD_MAX_FILE_SIZE_MB', '1')
+    client, _fake_storage, _manager = make_client(tmp_path)
+    response = client.post(
+        '/upload',
+        files={'file': ('too-large.bin', b'x' * (2 * 1024 * 1024), 'application/octet-stream')},
+        headers={'X-Requested-With': 'XMLHttpRequest'},
+    )
+
+    assert response.status_code == 413
+    assert '大小上限' in response.json()['detail']
 
 def test_init_upload_session_returns_parallelism_and_strategy(tmp_path):
     client, _, _ = make_client(tmp_path)
@@ -410,7 +438,8 @@ def test_index_shows_file_manager_panel_and_folder_actions(tmp_path):
     assert 'Bucket 根目录' in html
     assert '当前目录' in html
     assert '上传 / 新建文件夹 / 重命名默认作用在这里。' in html
-    assert '📁 docs/' in html
+    assert 'role="img" aria-label="目录">📁' in html
+    assert '>📁 docs/' not in html
     assert '重命名' in html
     assert '删除目录' in html
 
@@ -736,7 +765,7 @@ def test_batch_download_skips_failed_objects_and_emits_failure_manifest(tmp_path
     assert manifest['archived_count'] == 2
     assert manifest['failed_count'] == 1
     assert manifest['failed'] == [
-        {'object_name': 'missing/c.txt', 'detail': '异常信息：unexpected open_stream for missing/c.txt'}
+        {'object_name': 'missing/c.txt', 'detail': '读取对象服务暂时不可用，请稍后重试。'}
     ]
     failure_text = archive.read('_batch_download_failures.txt').decode('utf-8')
     assert 'missing/c.txt' in failure_text
@@ -1127,7 +1156,7 @@ def test_upload_part_failure_is_reported_without_mutating_uploaded_parts(tmp_pat
     )
     assert response.status_code == 500
     payload = response.json()
-    assert 'boom-part-2' in payload['detail']
+    assert payload['detail'] == '上传分片服务暂时不可用，请稍后重试。'
     assert payload['retryable'] is False
     assert payload['error_code'] == 'unknown'
 
@@ -1159,7 +1188,7 @@ def test_upload_part_timeout_is_marked_retryable(tmp_path):
     payload = response.json()
     assert payload['retryable'] is True
     assert payload['error_code'] == 'timeout'
-    assert '超时' in payload['reason']
+    assert '上传分片到对象存储超时' in payload['reason']
 
 
 def test_upload_part_http_5xx_is_marked_retryable(tmp_path):
@@ -1194,7 +1223,7 @@ def test_upload_part_http_5xx_is_marked_retryable(tmp_path):
     payload = response.json()
     assert payload['retryable'] is True
     assert payload['error_code'] == 'http_5xx'
-    assert 'HTTP 502' in payload['reason']
+    assert payload['reason'] == '上传分片服务暂时不可用，请稍后重试。'
 
 
 def test_upload_part_http_4xx_stops_retry_early(tmp_path):
@@ -1229,7 +1258,7 @@ def test_upload_part_http_4xx_stops_retry_early(tmp_path):
     payload = response.json()
     assert payload['retryable'] is False
     assert payload['error_code'] == 'http_4xx'
-    assert 'HTTP 400' in payload['reason']
+    assert payload['reason'] == '上传分片请求被对象存储拒绝（HTTP 400）。'
 
 
 def test_upload_part_http_429_is_retryable_and_returns_retry_after(tmp_path):
@@ -1298,7 +1327,7 @@ def test_delete_object_failure_is_reported(tmp_path):
     fake_storage.delete_hook = boom
     response = client.delete('/objects/missing.txt')
     assert response.status_code == 500
-    assert response.json()['detail'] == '删除对象失败：missing.txt。异常信息：missing object'
+    assert response.json()['detail'] == '删除对象失败：missing.txt。删除对象服务暂时不可用，请稍后重试。'
 
 
 def test_batch_delete_objects_requires_at_least_one_name(tmp_path):
@@ -1358,7 +1387,7 @@ def test_batch_delete_objects_partial_failure(tmp_path):
     assert payload['deleted_count'] == 2
     assert payload['failed_count'] == 1
     assert payload['deleted'] == ['alpha.txt', 'gamma.txt']
-    assert payload['failed'] == [{'object_name': 'folder/beta.txt', 'detail': '异常信息：locked'}]
+    assert payload['failed'] == [{'object_name': 'folder/beta.txt', 'detail': '删除对象服务暂时不可用，请稍后重试。'}]
     assert payload['message'] == '批量删除部分完成：成功 2 个，失败 1 个。'
     assert payload['detail'] == '失败对象：folder/beta.txt'
     assert fake_storage.deleted_objects == ['alpha.txt', 'gamma.txt']
@@ -1382,6 +1411,30 @@ def test_batch_delete_objects_failure_when_all_fail(tmp_path):
     assert payload['deleted_count'] == 0
     assert payload['failed_count'] == 2
     assert payload['failed'] == [
-        {'object_name': 'alpha.txt', 'detail': '异常信息：boom-alpha.txt'},
-        {'object_name': 'beta.txt', 'detail': '异常信息：boom-beta.txt'},
+        {'object_name': 'alpha.txt', 'detail': '删除对象服务暂时不可用，请稍后重试。'},
+        {'object_name': 'beta.txt', 'detail': '删除对象服务暂时不可用，请稍后重试。'},
     ]
+
+def test_object_paths_reject_parent_traversal(tmp_path):
+    client, _fake_storage, _manager = make_client(tmp_path)
+
+    delete_file = client.post('/api/files/delete', json={'path': '../secret.txt'})
+    assert delete_file.status_code == 400
+
+    batch_delete = client.post(
+        '/objects/batch-delete',
+        json={'object_names': ['..\\secret.txt'], 'confirmation_count': 1},
+    )
+    assert batch_delete.status_code == 400
+
+    batch_download = client.post(
+        '/objects/batch-download',
+        json={'object_names': ['../secret.txt']},
+    )
+    assert batch_download.status_code == 400
+
+    upload_init = client.post(
+        '/api/server-uploads/init',
+        json={'filename': '../secret.txt', 'file_size': 4, 'content_type': 'text/plain'},
+    )
+    assert upload_init.status_code == 400
